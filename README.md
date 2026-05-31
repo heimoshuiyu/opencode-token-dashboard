@@ -4,7 +4,7 @@
 
 ## 截图
 
-![OpenCode Token Dashboard](screenshot.jpg)
+![OpenCode Token Dashboard](https://github.com/heimoshuiyu/opencode-token-dashboard/releases/download/screenshot/screenshot.jpg)
 
 ## 功能
 

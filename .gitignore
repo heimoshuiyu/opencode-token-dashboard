@@ -26,6 +26,10 @@ bun.lock
 .DS_Store
 Thumbs.db
 
+# Screenshots (hosted on GitHub Releases)
+screenshot*.png
+screenshot*.jpg
+
 # Env
 .env
 .env.local
