@@ -1,0 +1,421 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import json
+import mimetypes
+import os
+import sqlite3
+from collections import defaultdict
+from datetime import date, datetime, timedelta
+from http import HTTPStatus
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+from typing import Any
+from urllib.parse import parse_qs, urlparse
+
+
+BASE_DIR = Path(__file__).resolve().parent
+STATIC_DIR = BASE_DIR / "static"
+OPENCODE_DATA_DIR = Path.home() / ".local" / "share" / "opencode"
+PREFERRED_DB_NAMES = [
+    "opencode.db",
+]
+
+HOST = os.getenv("HOST", "127.0.0.1")
+PORT = int(os.getenv("PORT", "8765"))
+
+USAGE_CACHE: dict[str, dict[str, Any]] = {}
+METRIC_KEYS = [
+    "total",
+    "active",
+    "input",
+    "output",
+    "reasoning",
+    "cache_read",
+    "cache_write",
+    "runtime",
+    "runtime_dedup",
+    "user_message_count",
+]
+
+
+def metric_template() -> dict[str, int]:
+    return {
+        "total": 0,
+        "active": 0,
+        "input": 0,
+        "output": 0,
+        "reasoning": 0,
+        "cache_read": 0,
+        "cache_write": 0,
+        "runtime": 0,
+        "runtime_dedup": 0,
+        "user_message_count": 0,
+    }
+
+
+def add_metrics(target: dict[str, int], source: dict[str, int]) -> None:
+    for key in METRIC_KEYS:
+        target[key] += int(source.get(key, 0) or 0)
+
+
+def merge_intervals(intervals: list[tuple[int, int]]) -> int:
+    """合并重叠区间，返回去重后的总时长（毫秒）。"""
+    if not intervals:
+        return 0
+    sorted_intervals = sorted(intervals)
+    merged = [sorted_intervals[0]]
+    for start, end in sorted_intervals[1:]:
+        if start <= merged[-1][1]:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], end))
+        else:
+            merged.append((start, end))
+    return sum(end - start for start, end in merged)
+
+
+def safe_int(value: Any) -> int:
+    try:
+        return int(value or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def extract_metrics(tokens: dict[str, Any] | None, time_info: dict[str, Any] | None = None, *, skip_runtime: bool = False) -> dict[str, int]:
+    tokens = tokens or {}
+    cache = tokens.get("cache") or {}
+
+    input_tokens = safe_int(tokens.get("input"))
+    output_tokens = safe_int(tokens.get("output"))
+    reasoning_tokens = safe_int(tokens.get("reasoning"))
+    cache_read_tokens = safe_int(cache.get("read"))
+    cache_write_tokens = safe_int(cache.get("write"))
+    active_tokens = input_tokens + output_tokens + reasoning_tokens
+    computed_total = active_tokens + cache_read_tokens + cache_write_tokens
+
+    total_tokens = safe_int(tokens.get("total"))
+    if total_tokens <= 0 and computed_total > 0:
+        total_tokens = computed_total
+
+    runtime_ms = 0
+    if not skip_runtime and time_info:
+        created = safe_int(time_info.get("created"))
+        completed = safe_int(time_info.get("completed"))
+        if created and completed and completed > created:
+            runtime_ms = completed - created
+
+    return {
+        "total": total_tokens,
+        "active": active_tokens,
+        "input": input_tokens,
+        "output": output_tokens,
+        "reasoning": reasoning_tokens,
+        "cache_read": cache_read_tokens,
+        "cache_write": cache_write_tokens,
+        "runtime": runtime_ms,
+    }
+
+
+def discover_databases() -> list[Path]:
+    if not OPENCODE_DATA_DIR.exists():
+        return []
+
+    db_files = [
+        path
+        for path in OPENCODE_DATA_DIR.iterdir()
+        if path.is_file() and path.suffix == ".db" and path.name.startswith("opencode")
+    ]
+
+    preferred_order = {name: index for index, name in enumerate(PREFERRED_DB_NAMES)}
+    db_files.sort(key=lambda path: (preferred_order.get(path.name, 999), path.name))
+    return db_files
+
+
+def resolve_database() -> Path:
+    db_files = discover_databases()
+    if not db_files:
+        raise FileNotFoundError(f"没有找到 OpenCode 数据库目录: {OPENCODE_DATA_DIR}")
+
+    return db_files[0]
+
+
+def resolve_day_window(
+    first_day: str | None,
+    last_day: str | None,
+    range_value: str | None,
+) -> tuple[str | None, str | None]:
+    if not first_day or not last_day:
+        return None, None
+
+    if not range_value or range_value == "all":
+        return first_day, last_day
+
+    try:
+        size = max(1, int(range_value))
+    except ValueError:
+        return first_day, last_day
+
+    first_date = date.fromisoformat(first_day)
+    last_date = date.fromisoformat(last_day)
+    selected_start = max(first_date, last_date - timedelta(days=size - 1))
+    return selected_start.isoformat(), last_day
+
+
+def aggregate_usage(db_path: Path, range_value: str | None) -> dict[str, Any]:
+    day_totals: dict[str, dict[str, int]] = defaultdict(metric_template)
+    model_totals: dict[str, dict[str, int]] = defaultdict(metric_template)
+    provider_totals: dict[str, dict[str, int]] = defaultdict(metric_template)
+
+    # (day, model, provider, metrics, interval_or_none)
+    assistant_entries: list[tuple[str, str, str, dict[str, int], tuple[int, int] | None]] = []
+    user_message_days: dict[str, int] = defaultdict(int)
+    first_day: str | None = None
+    last_day: str | None = None
+    scanned_rows = 0
+
+    connection = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+    try:
+        cursor = connection.cursor()
+
+        # 查出所有子 agent session（parent_id 不为空），runtime 指标排除它们
+        cursor.execute("SELECT id FROM session WHERE parent_id IS NOT NULL")
+        child_session_ids: set[str] = {row[0] for row in cursor}
+
+        cursor.execute(
+            "SELECT session_id, data FROM message WHERE data LIKE '%\"role\":\"assistant\"%' ORDER BY time_created ASC"
+        )
+
+        for session_id, raw_data in cursor:
+            scanned_rows += 1
+            try:
+                payload = json.loads(raw_data)
+            except json.JSONDecodeError:
+                continue
+
+            if payload.get("role") != "assistant":
+                continue
+
+            time_info = payload.get("time") or {}
+            timestamp_ms = time_info.get("completed") or time_info.get("created")
+            if not timestamp_ms:
+                continue
+
+            is_child_agent = session_id in child_session_ids
+            metrics = extract_metrics(payload.get("tokens"), time_info, skip_runtime=is_child_agent)
+            day = datetime.fromtimestamp(timestamp_ms / 1000).strftime("%Y-%m-%d")
+            model = payload.get("modelID") or "unknown"
+            provider = payload.get("providerID") or "unknown"
+
+            # 收集区间用于 runtime_dedup（仅非子 agent 且有有效时间差）
+            interval: tuple[int, int] | None = None
+            if metrics["runtime"] > 0:
+                created = safe_int(time_info.get("created"))
+                completed = safe_int(time_info.get("completed"))
+                if created and completed:
+                    interval = (created, completed)
+
+            first_day = first_day or day
+            last_day = day
+            assistant_entries.append((day, model, provider, metrics, interval))
+
+        # 查询 user message 数量，按天聚合（排除子 agent 会话）
+        cursor.execute(
+            "SELECT session_id, data FROM message WHERE data LIKE '%\"role\":\"user\"%'"
+        )
+        for session_id, raw_data in cursor:
+            if session_id in child_session_ids:
+                continue
+            try:
+                payload = json.loads(raw_data)
+            except json.JSONDecodeError:
+                continue
+            if payload.get("role") != "user":
+                continue
+            time_info = payload.get("time") or {}
+            timestamp_ms = time_info.get("completed") or time_info.get("created")
+            if not timestamp_ms:
+                continue
+            day = datetime.fromtimestamp(timestamp_ms / 1000).strftime("%Y-%m-%d")
+            user_message_days[day] += 1
+    finally:
+        connection.close()
+
+    selected_first_day, selected_last_day = resolve_day_window(first_day, last_day, range_value)
+
+    day_intervals: dict[str, list[tuple[int, int]]] = defaultdict(list)
+    model_intervals: dict[str, list[tuple[int, int]]] = defaultdict(list)
+    provider_intervals: dict[str, list[tuple[int, int]]] = defaultdict(list)
+    all_intervals: list[tuple[int, int]] = []
+
+    assistant_rows = 0
+    for day, model, provider, metrics, interval in assistant_entries:
+        if selected_first_day and day < selected_first_day:
+            continue
+        if selected_last_day and day > selected_last_day:
+            continue
+
+        add_metrics(day_totals[day], metrics)
+        add_metrics(model_totals[model], metrics)
+        add_metrics(provider_totals[provider], metrics)
+
+        if interval:
+            day_intervals[day].append(interval)
+            model_intervals[model].append(interval)
+            provider_intervals[provider].append(interval)
+            all_intervals.append(interval)
+
+        assistant_rows += 1
+
+    # 注入 user message 计数到 day_totals
+    for day, count in user_message_days.items():
+        if selected_first_day and day < selected_first_day:
+            continue
+        if selected_last_day and day > selected_last_day:
+            continue
+        day_totals[day]["user_message_count"] = count
+
+    # 计算去重后的运行时长
+    for day, intervals in day_intervals.items():
+        day_totals[day]["runtime_dedup"] = merge_intervals(intervals)
+    for model, intervals in model_intervals.items():
+        model_totals[model]["runtime_dedup"] = merge_intervals(intervals)
+    for provider, intervals in provider_intervals.items():
+        provider_totals[provider]["runtime_dedup"] = merge_intervals(intervals)
+
+    days = [
+        {"date": day, **metrics}
+        for day, metrics in sorted(day_totals.items(), key=lambda item: item[0])
+    ]
+    models = [
+        {"name": model, **metrics}
+        for model, metrics in sorted(
+            model_totals.items(), key=lambda item: (-item[1]["total"], item[0])
+        )
+    ]
+    providers = [
+        {"name": provider, **metrics}
+        for provider, metrics in sorted(
+            provider_totals.items(), key=lambda item: (-item[1]["total"], item[0])
+        )
+    ]
+
+    summary = metric_template()
+    for day in days:
+        add_metrics(summary, day)
+    summary["runtime_dedup"] = merge_intervals(all_intervals)
+
+    return {
+        "meta": {
+            "database": db_path.name,
+            "databasePath": str(db_path),
+            "generatedAt": datetime.now().isoformat(timespec="seconds"),
+            "timezone": datetime.now().astimezone().tzname() or "local",
+            "firstDay": selected_first_day,
+            "lastDay": selected_last_day,
+            "availableFirstDay": first_day,
+            "availableLastDay": last_day,
+            "range": range_value or "all",
+            "assistantMessageCount": assistant_rows,
+            "scannedRows": scanned_rows,
+        },
+        "summary": summary,
+        "days": days,
+        "models": models,
+        "providers": providers,
+    }
+
+
+def get_usage_payload(db_path: Path, range_value: str | None) -> dict[str, Any]:
+    stat = db_path.stat()
+    cache_key = f"{db_path}::{range_value or 'all'}"
+    signature = f"{db_path}:{range_value or 'all'}:{stat.st_mtime_ns}:{stat.st_size}"
+    cached = USAGE_CACHE.get(cache_key)
+    if cached and cached.get("signature") == signature:
+        return cached["payload"]
+
+    payload = aggregate_usage(db_path, range_value)
+    USAGE_CACHE[cache_key] = {
+        "signature": signature,
+        "payload": payload,
+    }
+    return payload
+
+
+class DashboardHandler(BaseHTTPRequestHandler):
+    server_version = "OpenCodeTokenDashboard/1.0"
+
+    def do_GET(self) -> None:  # noqa: N802
+        parsed = urlparse(self.path)
+        path = parsed.path
+
+        if path == "/api/usage":
+            self.handle_usage(parsed.query)
+            return
+
+        if path == "/health":
+            self.send_json({"ok": True})
+            return
+
+        self.serve_static(path)
+
+    def log_message(self, format: str, *args: Any) -> None:
+        print(f"[{self.log_date_time_string()}] {format % args}")
+
+    def handle_usage(self, query: str) -> None:
+        params = parse_qs(query)
+        range_value = params.get("range", ["all"])[0]
+
+        try:
+            db_path = resolve_database()
+            payload = get_usage_payload(db_path, range_value)
+        except FileNotFoundError as error:
+            self.send_json({"error": str(error)}, status=HTTPStatus.NOT_FOUND)
+            return
+        except sqlite3.Error as error:
+            self.send_json({"error": f"读取数据库失败: {error}"}, status=HTTPStatus.INTERNAL_SERVER_ERROR)
+            return
+        except Exception as error:  # noqa: BLE001
+            self.send_json({"error": f"生成统计失败: {error}"}, status=HTTPStatus.INTERNAL_SERVER_ERROR)
+            return
+
+        self.send_json(payload)
+
+    def serve_static(self, request_path: str) -> None:
+        normalized = request_path.lstrip("/") or "index.html"
+        file_path = (STATIC_DIR / normalized).resolve()
+
+        if not str(file_path).startswith(str(STATIC_DIR.resolve())) or not file_path.exists() or not file_path.is_file():
+            self.send_json({"error": "Not found"}, status=HTTPStatus.NOT_FOUND)
+            return
+
+        content_type, _ = mimetypes.guess_type(file_path.name)
+        content_type = content_type or "application/octet-stream"
+        data = file_path.read_bytes()
+
+        self.send_response(HTTPStatus.OK)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+    def send_json(self, payload: dict[str, Any], status: HTTPStatus = HTTPStatus.OK) -> None:
+        raw = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(raw)))
+        self.end_headers()
+        self.wfile.write(raw)
+
+
+def main() -> None:
+    server = ThreadingHTTPServer((HOST, PORT), DashboardHandler)
+    print(f"OpenCode token dashboard running at http://{HOST}:{PORT}")
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        print("\nShutting down...")
+    finally:
+        server.server_close()
+
+
+if __name__ == "__main__":
+    main()
