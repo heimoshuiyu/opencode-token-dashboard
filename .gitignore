@@ -1,7 +1,31 @@
+# Dependencies
 node_modules/
+
+# Build output
+/target/
+dist/
 static/
+
+# Python artifacts
 __pycache__/
 *.pyc
-/target/
+*.pyo
+server.py.bak
 
+# Lock files (keep package-lock.json for reproducibility)
 bun.lock
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Env
+.env
+.env.local
