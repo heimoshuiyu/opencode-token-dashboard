@@ -24,6 +24,21 @@ export interface ProviderEntry extends MetricSummary {
   name: string;
 }
 
+export interface ProviderModelEntry extends MetricSummary {
+  provider: string;
+  model: string;
+}
+
+export interface ProviderModelDayEntry extends MetricSummary {
+  date: string;
+}
+
+export interface ProviderModelTrendEntry {
+  provider: string;
+  model: string;
+  days: ProviderModelDayEntry[];
+}
+
 export interface Meta {
   database: string;
   databasePath: string;
@@ -44,6 +59,8 @@ export interface UsagePayload {
   days: DayEntry[];
   models: ModelEntry[];
   providers: ProviderEntry[];
+  providerModels: ProviderModelEntry[];
+  providerModelTrends: ProviderModelTrendEntry[];
 }
 
 export type MetricKey = keyof MetricSummary;

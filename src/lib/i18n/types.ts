@@ -53,6 +53,13 @@ export interface Translations {
     noCompositionData: string;
     noModelData: string;
     noProviderData: string;
+    cacheHitRateTitle: string;
+    cacheHitRateDesc: string;
+    cacheHitRate: string;
+    inputTokens: string;
+    cachedTokens: string;
+    clickToSolo: string;
+    clickToShowAll: string;
   };
   range: {
     last7: string;

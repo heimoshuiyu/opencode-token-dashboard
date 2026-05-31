@@ -8,6 +8,7 @@ import { TrendChart } from "@/components/trend-chart";
 import { CompositionChart } from "@/components/composition-chart";
 import { ModelChart } from "@/components/model-chart";
 import { ProviderChart } from "@/components/provider-chart";
+import { CacheHitRateChart } from "@/components/cache-hit-rate-chart";
 import { Button } from "@/components/ui/button";
 import {
   Select,
@@ -173,6 +174,10 @@ export function App() {
           <div className="relative lg:col-span-5">
             {loading && <div className="absolute inset-0 z-10 rounded-xl bg-background/50 backdrop-blur-[2px]" />}
             <ProviderChart items={data?.providers || []} metric={metric} loading={loading} />
+          </div>
+          <div className="relative lg:col-span-12">
+            {loading && <div className="absolute inset-0 z-10 rounded-xl bg-background/50 backdrop-blur-[2px]" />}
+            <CacheHitRateChart trends={data?.providerModelTrends || []} loading={loading} />
           </div>
         </div>
 

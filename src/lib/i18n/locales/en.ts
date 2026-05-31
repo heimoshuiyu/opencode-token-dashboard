@@ -53,6 +53,13 @@ export const en: Translations = {
     noCompositionData: "No token composition data",
     noModelData: "No model data",
     noProviderData: "No provider data",
+    cacheHitRateTitle: "Cache Hit Rate",
+    cacheHitRateDesc: "Cache ratio in input tokens by provider + model",
+    cacheHitRate: "Hit Rate",
+    inputTokens: "Input Tokens",
+    cachedTokens: "Cached Tokens",
+    clickToSolo: "Click to solo this model",
+    clickToShowAll: "Click to show all",
   },
   range: {
     last7: "Last 7 days",

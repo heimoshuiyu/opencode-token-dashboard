@@ -92,6 +92,30 @@ struct NamedEntry {
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
+struct ProviderModelEntry {
+    provider: String,
+    model: String,
+    #[serde(flatten)]
+    metrics: Metrics,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct ProviderModelDayEntry {
+    date: String,
+    #[serde(flatten)]
+    metrics: Metrics,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ProviderModelTrendEntry {
+    provider: String,
+    model: String,
+    days: Vec<ProviderModelDayEntry>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
 struct Meta {
     database: String,
     database_path: String,
@@ -114,6 +138,8 @@ struct UsagePayload {
     days: Vec<DayEntry>,
     models: Vec<NamedEntry>,
     providers: Vec<NamedEntry>,
+    provider_models: Vec<ProviderModelEntry>,
+    provider_model_trends: Vec<ProviderModelTrendEntry>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -391,6 +417,8 @@ fn aggregate_usage(db_path: &Path, range_value: Option<&str>) -> Result<UsagePay
     let mut day_totals: HashMap<String, Metrics> = HashMap::new();
     let mut model_totals: HashMap<String, Metrics> = HashMap::new();
     let mut provider_totals: HashMap<String, Metrics> = HashMap::new();
+    let mut provider_model_totals: HashMap<(String, String), Metrics> = HashMap::new();
+    let mut provider_model_day_totals: HashMap<(String, String), HashMap<String, Metrics>> = HashMap::new();
     let mut user_message_days: HashMap<String, i64> = HashMap::new();
 
     // (bucket, model, provider, metrics, interval)
@@ -586,6 +614,16 @@ fn aggregate_usage(db_path: &Path, range_value: Option<&str>) -> Result<UsagePay
             .entry(provider.clone())
             .or_default()
             .add(metrics);
+        provider_model_totals
+            .entry((provider.clone(), model.clone()))
+            .or_default()
+            .add(metrics);
+        provider_model_day_totals
+            .entry((provider.clone(), model.clone()))
+            .or_default()
+            .entry(bucket.clone())
+            .or_default()
+            .add(metrics);
 
         if let Some(iv) = interval {
             bucket_intervals.entry(bucket.clone()).or_default().push(*iv);
@@ -661,6 +699,46 @@ fn aggregate_usage(db_path: &Path, range_value: Option<&str>) -> Result<UsagePay
         .collect();
     providers.sort_by(|a, b| b.metrics.total.cmp(&a.metrics.total).then(a.name.cmp(&b.name)));
 
+    let mut provider_models: Vec<ProviderModelEntry> = provider_model_totals
+        .into_iter()
+        .map(|((provider, model), metrics)| ProviderModelEntry { provider, model, metrics })
+        .collect();
+    provider_models.sort_by(|a, b| {
+        // Sort by provider, then by total desc, then by model name
+        match a.provider.cmp(&b.provider) {
+            std::cmp::Ordering::Equal => b.metrics.total.cmp(&a.metrics.total).then(a.model.cmp(&b.model)),
+            other => other,
+        }
+    });
+
+    // Build provider_model_trends — daily time series per provider+model
+    let provider_model_trends: Vec<ProviderModelTrendEntry> = {
+        let mut trends: Vec<ProviderModelTrendEntry> = provider_model_day_totals
+            .into_iter()
+            .map(|((provider, model), day_map)| {
+                let mut day_entries: Vec<ProviderModelDayEntry> = day_map
+                    .into_iter()
+                    .map(|(date, metrics)| ProviderModelDayEntry { date, metrics })
+                    .collect();
+                day_entries.sort_by(|a, b| a.date.cmp(&b.date));
+                ProviderModelTrendEntry { provider, model, days: day_entries }
+            })
+            .collect();
+        // Sort by total desc, then provider, then model
+        trends.sort_by(|a, b| {
+            let total_a: i64 = a.days.iter().map(|d| d.metrics.total).sum();
+            let total_b: i64 = b.days.iter().map(|d| d.metrics.total).sum();
+            match total_b.cmp(&total_a) {
+                std::cmp::Ordering::Equal => match a.provider.cmp(&b.provider) {
+                    std::cmp::Ordering::Equal => a.model.cmp(&b.model),
+                    other => other,
+                },
+                other => other,
+            }
+        });
+        trends
+    };
+
     let mut summary = Metrics::default();
     for day in &days {
         summary.add(&day.metrics);
@@ -689,6 +767,8 @@ fn aggregate_usage(db_path: &Path, range_value: Option<&str>) -> Result<UsagePay
         days,
         models,
         providers,
+        provider_models,
+        provider_model_trends,
     })
 }
 

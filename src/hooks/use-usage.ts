@@ -26,7 +26,12 @@ function enrichPayload(payload: UsagePayload): UsagePayload {
   const days = payload.days.map(injectCacheHitRate);
   const models = payload.models.map(injectCacheHitRate);
   const providers = payload.providers.map(injectCacheHitRate);
-  return { ...payload, summary, days, models, providers };
+  const providerModels = (payload.providerModels || []).map(injectCacheHitRate);
+  const providerModelTrends = (payload.providerModelTrends || []).map((trend) => ({
+    ...trend,
+    days: trend.days.map(injectCacheHitRate),
+  }));
+  return { ...payload, summary, days, models, providers, providerModels, providerModelTrends };
 }
 
 export function useUsage(range: string) {

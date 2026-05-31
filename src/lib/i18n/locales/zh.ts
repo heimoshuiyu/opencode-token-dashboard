@@ -53,6 +53,13 @@ export const zh: Translations = {
     noCompositionData: "暂无 Token 组成数据",
     noModelData: "暂无模型数据",
     noProviderData: "暂无 Provider 数据",
+    cacheHitRateTitle: "缓存命中率",
+    cacheHitRateDesc: "按 Provider + 模型统计输入部分的缓存占比",
+    cacheHitRate: "命中率",
+    inputTokens: "输入 Tokens",
+    cachedTokens: "缓存 Tokens",
+    clickToSolo: "点击单独查看此模型",
+    clickToShowAll: "点击显示全部",
   },
   range: {
     last7: "最近 7 天",
