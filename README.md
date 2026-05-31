@@ -4,7 +4,7 @@
 
 ## 截图
 
-> TODO: 添加截图
+![OpenCode Token Dashboard](screenshot.jpg)
 
 ## 功能
 
