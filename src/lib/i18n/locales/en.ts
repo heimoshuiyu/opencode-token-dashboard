@@ -32,7 +32,7 @@ export const en: Translations = {
     totalTokens: "Total Tokens",
     currentRangeTotal: "Range total",
     userMessages: "User messages",
-    perDay: "{value} / day",
+    perDay: "{value}/day avg",
   },
   chart: {
     trend: "Trend",

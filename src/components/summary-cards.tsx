@@ -16,6 +16,7 @@ interface SummaryCardsProps {
   days: DayEntry[];
   summary: MetricSummary;
   metric: MetricKey;
+  range: string;
 }
 
 /** Whether the data uses hourly buckets (e.g. "2026-05-30T14"). */
@@ -32,34 +33,73 @@ function uniqueDayCount(days: DayEntry[]): number {
   return seen.size;
 }
 
-/** Find the last entry with non-zero value for the given metric. */
-function findLastNonZeroEntry(days: DayEntry[], metric: MetricKey): DayEntry | undefined {
-  for (let i = days.length - 1; i >= 0; i--) {
-    if ((days[i][metric] || 0) > 0) return days[i];
+/** Recompute cache_hit_rate from raw counter fields (it's a rate, not additive). */
+function recomputeCacheHitRate(entry: { input: number; cache_read: number; cache_write: number; cache_hit_rate: number }): void {
+  const inputTotal = (entry.input || 0) + (entry.cache_read || 0) + (entry.cache_write || 0);
+  entry.cache_hit_rate = inputTotal === 0 ? 0 : Math.round(((entry.cache_read || 0) + (entry.cache_write || 0)) / inputTotal * 1000) / 10;
+}
+
+/**
+ * Aggregate hourly buckets into daily buckets by summing additive numeric fields.
+ * cache_hit_rate is recomputed after aggregation since it is a rate, not a counter.
+ * If data is already daily, returns a shallow copy as-is.
+ */
+function aggregateToDays(days: DayEntry[]): DayEntry[] {
+  if (!isHourlyData(days)) return days.slice();
+
+  const dayMap = new Map<string, DayEntry>();
+  for (const d of days) {
+    const dayKey = d.date.slice(0, 10);
+    const existing = dayMap.get(dayKey);
+    if (existing) {
+      // Sum additive numeric metric fields (skip cache_hit_rate — it's a rate)
+      for (const key of Object.keys(d) as (keyof DayEntry)[]) {
+        if (key === "date" || key === "cache_hit_rate") continue;
+        const val = d[key];
+        if (typeof val === "number") {
+          (existing as unknown as Record<string, unknown>)[key] = ((existing[key] as number) || 0) + val;
+        }
+      }
+    } else {
+      dayMap.set(dayKey, { ...d, date: dayKey });
+    }
   }
-  return days.at(-1);
+
+  // Recompute cache_hit_rate from the summed counters
+  for (const entry of dayMap.values()) {
+    recomputeCacheHitRate(entry);
+  }
+
+  return Array.from(dayMap.values()).sort((a, b) => a.date.localeCompare(b.date));
 }
 
-/** Extract display date string from a bucket key (hourly or daily). */
-function toDisplayDate(dateStr: string): string {
-  // hourly "2026-05-30T14" → "2026-05-30" for Date parsing
-  return dateStr.includes("T") ? dateStr.slice(0, 10) : dateStr;
+/** Find the last entry with non-zero value for the given metric (works on day-level data). */
+function findLastNonZeroDay(dayEntries: DayEntry[], metric: MetricKey): DayEntry | undefined {
+  for (let i = dayEntries.length - 1; i >= 0; i--) {
+    if ((dayEntries[i][metric] || 0) > 0) return dayEntries[i];
+  }
+  return dayEntries.at(-1);
 }
 
-export function SummaryCards({ days, summary, metric }: SummaryCardsProps) {
+export function SummaryCards({ days, summary, metric, range }: SummaryCardsProps) {
   const { locale, t } = useLocale();
   const metricLabel = t(`metric.${metric}`);
-  const hourly = isHourlyData(days);
   const dayCount = uniqueDayCount(days);
 
-  const latestDay = findLastNonZeroEntry(days, metric);
+  // Display the user-selected range as the "total" card subtitle
+  const rangeDayCount = range === "all" ? dayCount : parseInt(range, 10) || dayCount;
+
+  // Aggregate hourly data into day-level for today/peak/average calculations
+  const dayEntries = aggregateToDays(days);
+
+  const latestDay = findLastNonZeroDay(dayEntries, metric);
   const todayStr = getLocalDateString();
-  const latestDayStr = latestDay ? toDisplayDate(latestDay.date) : "";
+  const latestDayStr = latestDay ? latestDay.date : "";
   const isToday = latestDayStr === todayStr;
   const latestLabel = isToday ? t("summary.today") : t("summary.latestDay");
   const latestValue = latestDay?.[metric] || 0;
   const average = dayCount ? Math.round((summary[metric] || 0) / dayCount) : 0;
-  const peakDay = findPeakDay(days, metric);
+  const peakDay = findPeakDay(dayEntries, metric);
 
   const utilityCard =
     metric === "user_message_count"
@@ -82,8 +122,8 @@ export function SummaryCards({ days, summary, metric }: SummaryCardsProps) {
     {
       label: latestLabel,
       value: formatMetricValue(metric, latestValue, locale),
-      subtitle: latestDay?.date && !isNaN(new Date(`${toDisplayDate(latestDay.date)}T00:00:00`).getTime())
-        ? `${metricLabel} · ${new Intl.DateTimeFormat(locale === "en" ? "en-US" : "zh-CN", { month: "2-digit", day: "2-digit" }).format(new Date(`${toDisplayDate(latestDay.date)}T00:00:00`))}${hourly && latestDay.date.includes("T") ? ` ${latestDay.date.slice(12)}:00` : ""}`
+      subtitle: latestDay?.date && !isNaN(new Date(`${latestDay.date}T00:00:00`).getTime())
+        ? `${metricLabel} · ${new Intl.DateTimeFormat(locale === "en" ? "en-US" : "zh-CN", { month: "2-digit", day: "2-digit" }).format(new Date(`${latestDay.date}T00:00:00`))}`
         : metricLabel,
       icon: isToday ? <ClockIcon className="size-3.5" /> : <CalendarDaysIcon className="size-3.5" />,
       accent: "text-chart-1",
@@ -91,7 +131,7 @@ export function SummaryCards({ days, summary, metric }: SummaryCardsProps) {
     {
       label: t("summary.total"),
       value: formatMetricValue(metric, summary[metric] || 0, locale),
-      subtitle: t("summary.days", { count: dayCount }),
+      subtitle: t("summary.days", { count: rangeDayCount }),
       icon: <BarChart3Icon className="size-3.5" />,
       accent: "text-chart-2",
     },
@@ -105,8 +145,8 @@ export function SummaryCards({ days, summary, metric }: SummaryCardsProps) {
     {
       label: t("summary.peak"),
       value: peakDay ? formatMetricValue(metric, peakDay[metric] || 0, locale) : "0",
-      subtitle: peakDay && !isNaN(new Date(`${toDisplayDate(peakDay.date)}T00:00:00`).getTime())
-        ? `${new Intl.DateTimeFormat(locale === "en" ? "en-US" : "zh-CN", { month: "2-digit", day: "2-digit" }).format(new Date(`${toDisplayDate(peakDay.date)}T00:00:00`))}${hourly && peakDay.date.includes("T") ? ` ${peakDay.date.slice(12)}:00` : ""}`
+      subtitle: peakDay && !isNaN(new Date(`${peakDay.date}T00:00:00`).getTime())
+        ? `${new Intl.DateTimeFormat(locale === "en" ? "en-US" : "zh-CN", { month: "2-digit", day: "2-digit" }).format(new Date(`${peakDay.date}T00:00:00`))}`
         : t("summary.noData"),
       icon: <ArrowUpIcon className="size-3.5" />,
       accent: "text-chart-4",

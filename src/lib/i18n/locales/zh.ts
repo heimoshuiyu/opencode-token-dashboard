@@ -32,7 +32,7 @@ export const zh: Translations = {
     totalTokens: "总 Tokens",
     currentRangeTotal: "当前范围合计",
     userMessages: "用户消息",
-    perDay: "{value} / 天",
+    perDay: "日均 {value} 条",
   },
   chart: {
     trend: "Trend",

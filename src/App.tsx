@@ -153,7 +153,7 @@ export function App() {
               ))}
             </div>
           ) : data ? (
-            <SummaryCards days={data.days} summary={data.summary} metric={metric} />
+            <SummaryCards days={data.days} summary={data.summary} metric={metric} range={range} />
           ) : null}
         </div>
 
