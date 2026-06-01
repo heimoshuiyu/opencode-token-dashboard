@@ -822,8 +822,14 @@ async fn get_usage_payload(
         .as_nanos();
     let size = stat.len();
 
+    // Include current date in cache signature so the cache auto-invalidates at midnight.
+    // This ensures date-dependent logic (e.g. fill_missing_hours, generated_at)
+    // always reflects the actual request time, not the server startup time.
+    // Date is only added to signature (not key) so the old entry is replaced in-place
+    // rather than accumulating stale entries across days.
+    let today = Local::now().format("%Y-%m-%d").to_string();
     let cache_key = format!("{}::{}", db_path.display(), range_value.unwrap_or("all"));
-    let signature = format!("{}:{}:{mtime}:{size}", db_path.display(), range_value.unwrap_or("all"));
+    let signature = format!("{}:{}:{mtime}:{size}:{today}", db_path.display(), range_value.unwrap_or("all"));
 
     {
         let cache = state.cache.read().await;
