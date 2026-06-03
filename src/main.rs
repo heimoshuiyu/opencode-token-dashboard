@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::SystemTime;
@@ -518,10 +518,34 @@ fn aggregate_usage(db_path: &Path, range_value: Option<&str>) -> Result<UsagePay
 
     drop(stmt);
 
+    // Get user message IDs that have at least one non-synthetic text/file part.
+    // Messages whose ALL text/file parts are synthetic (or have no text/file parts at all)
+    // are considered program-generated and should be excluded from user message count.
+    let valid_user_message_ids: HashSet<String> = {
+        let mut stmt = conn
+            .prepare(
+                "SELECT DISTINCT p.message_id FROM part p \
+                 JOIN message m ON p.message_id = m.id \
+                 JOIN session s ON m.session_id = s.id \
+                 WHERE m.data LIKE '%\"role\":\"user\"%' \
+                 AND s.directory NOT LIKE '%.opencode%' \
+                 AND s.directory NOT LIKE '/home/hmsy/.config/pet%' \
+                 AND json_extract(p.data, '$.type') IN ('text', 'file') \
+                 AND (json_extract(p.data, '$.synthetic') IS NULL OR json_extract(p.data, '$.synthetic') != 1)",
+            )
+            .map_err(|e| format!("查询有效用户消息失败: {e}"))?;
+
+        let rows = stmt
+            .query_map([], |row| row.get::<_, String>(0))
+            .map_err(|e| format!("执行查询失败: {e}"))?;
+
+        rows.filter_map(|r| r.ok()).collect()
+    };
+
     // Query user messages (excluding ignored sessions)
     let mut stmt = conn
         .prepare(
-            "SELECT m.session_id, m.data FROM message m \
+            "SELECT m.id, m.session_id, m.data FROM message m \
              JOIN session s ON m.session_id = s.id \
              WHERE m.data LIKE '%\"role\":\"user\"%' \
              AND s.directory NOT LIKE '%.opencode%' \
@@ -531,17 +555,22 @@ fn aggregate_usage(db_path: &Path, range_value: Option<&str>) -> Result<UsagePay
 
     let rows = stmt
         .query_map([], |row| {
-            let session_id: String = row.get(0)?;
-            let data: String = row.get(1)?;
-            Ok((session_id, data))
+            let id: String = row.get(0)?;
+            let session_id: String = row.get(1)?;
+            let data: String = row.get(2)?;
+            Ok((id, session_id, data))
         })
         .map_err(|e| format!("执行查询失败: {e}"))?;
 
     for row in rows {
-        let (session_id, raw_data) = match row {
+        let (id, session_id, raw_data) = match row {
             Ok(r) => r,
             Err(_) => continue,
         };
+
+        if !valid_user_message_ids.contains(&id) {
+            continue;
+        }
 
         if child_session_ids.contains(&session_id) {
             continue;
