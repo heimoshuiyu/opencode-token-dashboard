@@ -37,6 +37,31 @@ export function formatDuration(ms: number): string {
   return `${hours}h ${rMinutes}m`;
 }
 
+/**
+ * Format a gap duration as "+X分钟Y秒" / "+X小时Y分Z秒" (zh) or compact
+ * "+Xm Ys" / "+Xh Ym Zs" (en), precise to whole seconds.
+ */
+export function formatDurationGap(ms: number, locale?: Locale): string {
+  const totalSec = Math.max(0, Math.floor(ms / 1000));
+  const s = totalSec % 60;
+  const totalMin = Math.floor(totalSec / 60);
+  const m = totalMin % 60;
+  const totalH = Math.floor(totalMin / 60);
+  const h = totalH % 24;
+  const d = Math.floor(totalH / 24);
+  const zh = locale !== "en";
+  if (zh) {
+    if (totalMin === 0) return `+${s}秒`;
+    if (totalH === 0) return `+${m}分钟${s}秒`;
+    if (d === 0) return `+${h}小时${m}分${s}秒`;
+    return `+${d}天${h}小时${m}分${s}秒`;
+  }
+  if (totalMin === 0) return `+${s}s`;
+  if (totalH === 0) return `+${m}m ${s}s`;
+  if (d === 0) return `+${h}h ${m}m ${s}s`;
+  return `+${d}d ${h}h ${m}m ${s}s`;
+}
+
 export function formatAxisValue(value: number, locale?: Locale): string {
   const abs = Math.abs(value);
   if (locale === "en") {

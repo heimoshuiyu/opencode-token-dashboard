@@ -83,6 +83,68 @@ export interface UsagePayload {
 
 export type MetricKey = keyof MetricSummary;
 
+// ── Cache-miss drill-down types ───────────────────────────────────────────
+
+export interface CacheMissSessionRow {
+  sessionId: string;
+  title: string;
+  provider: string;
+  model: string;
+  cacheMiss: number;
+  cacheExpected: number;
+  missRate: number;
+  pairs: number;
+  firstTime: number;
+  lastTime: number;
+  noCache: boolean;
+}
+
+export interface CacheMissSessionsPayload {
+  range: string;
+  totalMiss: number;
+  totalExpected: number;
+  sessions: CacheMissSessionRow[];
+}
+
+export interface CacheMissMessage {
+  id: string;
+  idx: number;
+  ts: number;
+  total: number;
+  cacheRead: number;
+  cacheWrite: number;
+  input: number;
+  output: number;
+  reasoning: number;
+  prevTotal: number | null;
+  miss: number | null;
+}
+
+export interface CacheMissSessionDetail {
+  sessionId: string;
+  title: string;
+  provider: string;
+  model: string;
+  noCache: boolean;
+  messages: CacheMissMessage[];
+}
+
+export interface MessageContentPart {
+  type: "text" | "reasoning" | "tool";
+  text?: string;
+  name?: string;
+  status?: string;
+  title?: string;
+  input?: string;
+  output?: string;
+  error?: string;
+}
+
+export interface MessageContentPayload {
+  messageId: string;
+  parts: MessageContentPart[];
+}
+
 export interface MetricMeta {
   label: string;
   color: string;

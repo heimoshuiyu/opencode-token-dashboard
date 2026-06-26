@@ -29,6 +29,7 @@ import { Skeleton } from "@/components/ui/skeleton";
 interface CacheHitRateChartProps {
   trends: ProviderModelTrendEntry[];
   loading: boolean;
+  onPointClick?: (date: string) => void;
 }
 
 interface SeriesItem {
@@ -128,7 +129,7 @@ function CacheTooltip(props: {
 
 // ── Main Component ───────────────────────────────────────────────────────
 
-export function CacheHitRateChart({ trends, loading }: CacheHitRateChartProps) {
+export function CacheHitRateChart({ trends, loading, onPointClick }: CacheHitRateChartProps) {
   const { locale, t } = useLocale();
   const typedLocale = locale as Locale;
   const [soloKey, setSoloKey] = useState<string | null>(null);
@@ -250,15 +251,29 @@ export function CacheHitRateChart({ trends, loading }: CacheHitRateChartProps) {
           {t("chart.cacheMissTitle")}
         </CardTitle>
         <CardDescription className="text-xs">
-          {t("chart.cacheMissDesc")}
+          {t("chart.cacheMissDesc")}{" "}
+          {onPointClick && <span className="text-muted-foreground/70">· {t("chart.clickPointHint")}</span>}
         </CardDescription>
       </CardHeader>
       <CardContent>
-        <ChartContainer config={chartConfig} className="h-[360px] w-full">
+        <ChartContainer config={chartConfig} className={`h-[360px] w-full${onPointClick ? " cursor-pointer" : ""}`}>
           <LineChart
             accessibilityLayer
             data={chartData}
             margin={{ top: 8, right: 12, left: 8, bottom: 0 }}
+            onClick={
+              onPointClick
+                ? (state) => {
+                    // recharts v3 returns activeTooltipIndex as a string.
+                    const raw = state?.activeTooltipIndex;
+                    const idx = typeof raw === "number" ? raw : Number(raw);
+                    if (Number.isInteger(idx) && idx >= 0) {
+                      const date = chartData[idx]?.date;
+                      if (date) onPointClick(date);
+                    }
+                  }
+                : undefined
+            }
           >
             <CartesianGrid
               vertical={false}

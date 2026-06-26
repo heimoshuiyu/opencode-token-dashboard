@@ -9,6 +9,7 @@ import { CompositionChart } from "@/components/composition-chart";
 import { ModelChart } from "@/components/model-chart";
 import { ProviderChart } from "@/components/provider-chart";
 import { CacheHitRateChart } from "@/components/cache-hit-rate-chart";
+import { CacheMissExplorer } from "@/components/cache-miss-explorer";
 import { HeatmapChart, EMPTY_HEATMAP } from "@/components/heatmap-chart";
 import { Button } from "@/components/ui/button";
 import {
@@ -29,6 +30,7 @@ import { useLocale } from "@/lib/i18n";
 export function App() {
   const [range, setRange] = useState("30");
   const [metric, setMetric] = useState<MetricKey>("total");
+  const [missExplorer, setMissExplorer] = useState<{ open: boolean; date: string | null }>({ open: false, date: null });
   const { data, loading, error, refresh } = useUsage(range);
   const { theme, setTheme } = useTheme();
   const { locale, setLocale, t } = useLocale();
@@ -182,7 +184,11 @@ export function App() {
           </div>
           <div className="relative lg:col-span-12">
             {loading && <div className="absolute inset-0 z-10 rounded-xl bg-background/50 backdrop-blur-[2px]" />}
-            <CacheHitRateChart trends={data?.providerModelTrends || []} loading={loading} />
+            <CacheHitRateChart
+              trends={data?.providerModelTrends || []}
+              loading={loading}
+              onPointClick={(date) => setMissExplorer({ open: true, date })}
+            />
           </div>
         </div>
 
@@ -200,6 +206,14 @@ export function App() {
           </>
         )}
       </div>
+
+      {/* Cache-miss drill-down dialog */}
+      <CacheMissExplorer
+        open={missExplorer.open}
+        onOpenChange={(o) => setMissExplorer((prev) => ({ ...prev, open: o }))}
+        range={range}
+        date={missExplorer.date}
+      />
     </div>
   );
 }

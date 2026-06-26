@@ -6,6 +6,10 @@
 
 ![OpenCode Token Dashboard](https://github.com/heimoshuiyu/opencode-token-dashboard/releases/download/v1.2.0/screenshot.jpg)
 
+### 缓存未命中下钻
+
+![缓存未命中下钻](<!-- TODO: 替换为缓存未命中 tokens 下钻对话框截图 -->)
+
 ## 功能
 
 - **趋势图** — 按天/小时查看 Token 用量变化，支持 7 天（小时粒度）和 30/90/180/365 天/全部（天粒度）
@@ -13,6 +17,7 @@
 - **组成分析** — 饼图展示输入/输出/推理/缓存占比
 - **模型排行** — Top 8 水平柱状图
 - **Provider 分布** — 各服务商用量占比
+- **缓存未命中分析** — 专图展示相邻请求间未命中的 token 数；点击数据点下钻到当天会话明细与逐条缓存生命周期
 - **去重运行时长** — 合并重叠时间区间，精确统计实际运行时间
 - **i18n** — 中文/英文切换
 - **暗色主题** — 跟随系统
@@ -88,52 +93,6 @@ Windows 版本启动后会自动打开浏览器。数据目录为 `%USERPROFILE%
 HOST=0.0.0.0 PORT=9000 ./target/release/opencode-token-dashboard
 ```
 
-## API
-
-### `GET /api/usage?range={range}`
-
-返回 Token 用量统计。
-
-**参数：**
-
-| range | 说明 | 粒度 |
-|---|---|---|
-| `7` | 最近 7 天 | 小时 |
-| `30` / `90` / `180` / `365` | 对应天数 | 天 |
-| `all` / 缺省 | 全部数据 | 天 |
-
-**响应示例：**
-
-```json
-{
-  "meta": {
-    "database": "opencode.db",
-    "range": "7",
-    "firstDay": "2026-05-24",
-    "lastDay": "2026-05-30"
-  },
-  "summary": {
-    "total": 1234567,
-    "active": 800000,
-    "input": 600000,
-    "output": 150000,
-    "reasoning": 50000,
-    "cache_read": 400000,
-    "cache_write": 34567,
-    "runtime": 3600000,
-    "runtime_dedup": 2400000,
-    "user_message_count": 500
-  },
-  "days": [...],
-  "models": [...],
-  "providers": [...]
-}
-```
-
-### `GET /health`
-
-健康检查，返回 `{"ok": true}`。
-
 ## 项目结构
 
 ```
@@ -162,6 +121,41 @@ opencode-token-dashboard/
 ├── package.json
 └── vite.config.ts
 ```
+
+## 缓存未命中 Tokens
+
+### 为什么用「未命中 Tokens」而不是「命中率」
+
+旧版本展示的是「缓存命中率」，定义为
+`(cache_read + cache_write) / (input + cache_read + cache_write)`。
+
+它有一个根本问题：**这个比率会随用户的使用模式和上下文长度而波动**。例如，用户每轮都注入大量新内容（长上下文）会显著拉低命中率——但这反映的是使用方式，而非 agent harness 或 provider 自身的缓存能力。比率把「上下文规模」和「缓存质量」混在一起，无法干净地反映后两者真正的问题。
+
+因此改为「缓存未命中 Tokens」：统计相邻请求之间**应命中却没命中**的 token 绝对数。它直接度量被重复处理、被浪费的 token，不受上下文长度归一化的干扰，更能真实反映 harness / provider 的缓存表现。
+
+### 计算方法
+
+在同一会话内，取**时间相邻**的两条 assistant 消息 `(prev → cur)`，当同时满足：
+
+- 同一 model、同一 provider（缓存按模型 / 服务商隔离）
+- 两者之间没有发生 compaction（压缩会重写上下文）
+- 两条消息都有真实 token 用量（排除被中止 / 出错、token 全为 0 的消息）
+
+时：
+
+```
+expected = prev.total                              # 上一条的完整上下文，本应被缓存
+miss     = max(0, prev.total − cur.cache_read)     # 应命中却没命中的部分
+total    = input + output + reasoning + cache_read + cache_write
+```
+
+`miss` 与 `expected` 都是可加的 token 计数，按 **天 / 会话 / provider / model** 聚合。
+
+### 为什么越接近零越好
+
+理想情况下，`cur` 会从缓存读回 `prev` 的全部上下文（`cache_read ≈ prev.total`），此时 `miss ≈ 0`。`miss > 0` 意味着一部分本应命中的上下文没有走缓存、被重新处理，直接带来更高的 token 消耗与延迟。因此**未命中 token 越少越好**。
+
+> 注：聚合后的总 miss 会随使用量增长，所以「越接近零」主要体现在**单次相邻请求 / 单会话**层面。实际中未命中通常来自：会话开头几条的缓存预热（warmup）、tool 结果插入导致缓存后缀失效、或 provider 根本不支持缓存。点击专图上的数据点可下钻查看该天的会话明细与逐条缓存生命周期。
 
 ## 统计说明
 

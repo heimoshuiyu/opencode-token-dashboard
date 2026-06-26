@@ -179,6 +179,17 @@ struct UsageQuery {
     range: Option<String>,
 }
 
+/// Query params for cache-miss drill-down. `date` (YYYY-MM-DD) filters to a
+/// single day; when present it overrides the range window. `provider`/`model`
+/// optionally narrow further (point-click only passes `date`).
+#[derive(Debug, Deserialize)]
+struct CacheMissQuery {
+    range: Option<String>,
+    date: Option<String>,
+    provider: Option<String>,
+    model: Option<String>,
+}
+
 // ── Cache ──────────────────────────────────────────────────────────────────
 
 struct CacheEntry {
@@ -276,6 +287,7 @@ fn extract_metrics(tokens: Option<&TokenData>, time: Option<&TimeData>, skip_run
 /// One assistant message, carrying everything needed for aggregation plus the
 /// session id + timestamp required to pair consecutive messages.
 struct AssistantEntry {
+    id: String,
     session_id: String,
     ts_ms: i64,
     bucket: String,
@@ -570,6 +582,137 @@ fn fill_missing_2h_blocks(
 
 // ── Core aggregation logic ─────────────────────────────────────────────────
 
+/// Load all assistant messages as AssistantEntry (ordered by time_created),
+/// applying the same directory filters as the usage path. `hourly` /
+/// `heatmap_hourly` only affect the precomputed bucket strings (unused by the
+/// cache-miss endpoints, which pass false). Returns (entries, first_day,
+/// last_day, scanned_rows).
+fn load_assistant_entries(
+    conn: &rusqlite::Connection,
+    hourly: bool,
+    heatmap_hourly: bool,
+) -> Result<(Vec<AssistantEntry>, Option<String>, Option<String>, i64), String> {
+    let child_session_ids: Vec<String> = conn
+        .prepare("SELECT id FROM session WHERE parent_id IS NOT NULL")
+        .and_then(|mut stmt| {
+            stmt.query_map([], |row| row.get(0))
+                .map(|rows| rows.filter_map(|r| r.ok()).collect())
+        })
+        .unwrap_or_default();
+
+    let mut stmt = conn
+        .prepare(
+            "SELECT m.id, m.session_id, m.data FROM message m \
+             JOIN session s ON m.session_id = s.id \
+             WHERE m.data LIKE '%\"role\":\"assistant\"%' \
+             AND s.directory NOT LIKE '%.opencode%' \
+             AND s.directory NOT LIKE '/home/hmsy/.config/pet%' \
+             ORDER BY m.time_created ASC",
+        )
+        .map_err(|e| format!("查询 assistant 消息失败: {e}"))?;
+
+    let rows = stmt
+        .query_map([], |row| {
+            let id: String = row.get(0)?;
+            let session_id: String = row.get(1)?;
+            let data: String = row.get(2)?;
+            Ok((id, session_id, data))
+        })
+        .map_err(|e| format!("执行查询失败: {e}"))?;
+
+    let mut entries: Vec<AssistantEntry> = Vec::new();
+    let mut first_day: Option<String> = None;
+    let mut last_day: Option<String> = None;
+    let mut scanned_rows: i64 = 0;
+
+    for row in rows {
+        let (id, session_id, raw_data) = match row {
+            Ok(r) => r,
+            Err(_) => continue,
+        };
+        scanned_rows += 1;
+        let payload: MessageData = match serde_json::from_str(&raw_data) {
+            Ok(p) => p,
+            Err(_) => continue,
+        };
+        if payload.role.as_deref() != Some("assistant") {
+            continue;
+        }
+        let time_info = payload.time.as_ref();
+        let timestamp_ms = time_info
+            .and_then(|t| t.completed.or(t.created))
+            .unwrap_or(0);
+        if timestamp_ms == 0 {
+            continue;
+        }
+        let is_child = child_session_ids.contains(&session_id);
+        let metrics = extract_metrics(payload.tokens.as_ref(), time_info, is_child);
+        let bucket = if hourly { format_hour(timestamp_ms) } else { format_day(timestamp_ms) };
+        let heatmap_bucket = if heatmap_hourly { format_2h_block(timestamp_ms) } else { format_day(timestamp_ms) };
+        let model = payload.model_id.as_deref().unwrap_or("unknown").to_string();
+        let provider = payload
+            .provider_id
+            .as_deref()
+            .unwrap_or("unknown")
+            .to_string();
+        let interval = if metrics.runtime > 0 {
+            if let Some(t) = time_info {
+                let created = t.created.unwrap_or(0);
+                let completed = t.completed.unwrap_or(0);
+                if created > 0 && completed > 0 {
+                    Some((created, completed))
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        first_day = Some(first_day.unwrap_or_else(|| format_day(timestamp_ms)));
+        last_day = Some(format_day(timestamp_ms));
+        entries.push(AssistantEntry {
+            id,
+            session_id,
+            ts_ms: timestamp_ms,
+            bucket,
+            heatmap_bucket,
+            model,
+            provider,
+            metrics,
+            interval,
+        });
+    }
+    Ok((entries, first_day, last_day, scanned_rows))
+}
+
+/// Load per-session compaction timestamps (epoch ms), sorted ascending.
+fn load_compaction_times(conn: &rusqlite::Connection) -> Result<HashMap<String, Vec<i64>>, String> {
+    let mut map: HashMap<String, Vec<i64>> = HashMap::new();
+    let mut stmt = conn
+        .prepare(
+            "SELECT sm.session_id, sm.time_created FROM session_message sm \
+             JOIN session s ON sm.session_id = s.id \
+             WHERE sm.type = 'compaction' \
+             AND s.directory NOT LIKE '%.opencode%' \
+             AND s.directory NOT LIKE '/home/hmsy/.config/pet%'",
+        )
+        .map_err(|e| format!("查询 compaction 消息失败: {e}"))?;
+    let rows = stmt
+        .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)))
+        .map_err(|e| format!("执行查询失败: {e}"))?;
+    for row in rows {
+        if let Ok((sid, ts)) = row {
+            map.entry(sid).or_default().push(ts);
+        }
+    }
+    for v in map.values_mut() {
+        v.sort_unstable();
+    }
+    Ok(map)
+}
+
 fn aggregate_usage(db_path: &Path, range_value: Option<&str>) -> Result<UsagePayload, String> {
     let conn = rusqlite_connection(db_path)?;
     let hourly = is_hourly_range(range_value);
@@ -586,14 +729,16 @@ fn aggregate_usage(db_path: &Path, range_value: Option<&str>) -> Result<UsagePay
     let mut heatmap_totals: HashMap<String, Metrics> = HashMap::new();
     let mut heatmap_user_messages: HashMap<String, i64> = HashMap::new();
 
-    // Collected assistant messages; pairing for cache-miss happens after the loop.
-    let mut assistant_entries: Vec<AssistantEntry> = Vec::new();
+    // Collected assistant messages; pairing for cache-miss happens after loading.
+    let (mut assistant_entries, first_day, last_day, scanned_rows) =
+        load_assistant_entries(&conn, hourly, heatmap_hourly)?;
 
-    let mut first_day: Option<String> = None;
-    let mut last_day: Option<String> = None;
-    let mut scanned_rows: i64 = 0;
+    let compaction_times = load_compaction_times(&conn)?;
 
-    // Get child session IDs
+    // Pair consecutive messages within each session to compute cache miss counters.
+    pair_cache_miss(&mut assistant_entries, &compaction_times);
+
+    // Child session IDs — used to exclude child sessions from user message count.
     let child_session_ids: Vec<String> = conn
         .prepare("SELECT id FROM session WHERE parent_id IS NOT NULL")
         .and_then(|mut stmt| {
@@ -601,131 +746,6 @@ fn aggregate_usage(db_path: &Path, range_value: Option<&str>) -> Result<UsagePay
                 .map(|rows| rows.filter_map(|r| r.ok()).collect())
         })
         .unwrap_or_default();
-
-    // Query assistant messages (excluding .opencode internal sessions)
-    let mut stmt = conn
-        .prepare(
-            "SELECT m.session_id, m.data FROM message m \
-             JOIN session s ON m.session_id = s.id \
-             WHERE m.data LIKE '%\"role\":\"assistant\"%' \
-             AND s.directory NOT LIKE '%.opencode%' \
-             AND s.directory NOT LIKE '/home/hmsy/.config/pet%' \
-             ORDER BY m.time_created ASC",
-        )
-        .map_err(|e| format!("查询 assistant 消息失败: {e}"))?;
-
-    let rows = stmt
-        .query_map([], |row| {
-            let session_id: String = row.get(0)?;
-            let data: String = row.get(1)?;
-            Ok((session_id, data))
-        })
-        .map_err(|e| format!("执行查询失败: {e}"))?;
-
-    for row in rows {
-        let (session_id, raw_data) = match row {
-            Ok(r) => r,
-            Err(_) => continue,
-        };
-
-        scanned_rows += 1;
-
-        let payload: MessageData = match serde_json::from_str(&raw_data) {
-            Ok(p) => p,
-            Err(_) => continue,
-        };
-
-        if payload.role.as_deref() != Some("assistant") {
-            continue;
-        }
-
-        let time_info = payload.time.as_ref();
-        let timestamp_ms = time_info
-            .and_then(|t| t.completed.or(t.created))
-            .unwrap_or(0);
-
-        if timestamp_ms == 0 {
-            continue;
-        }
-
-        let is_child = child_session_ids.contains(&session_id);
-        let metrics = extract_metrics(payload.tokens.as_ref(), time_info, is_child);
-        let bucket = if hourly { format_hour(timestamp_ms) } else { format_day(timestamp_ms) };
-        let heatmap_bucket = if heatmap_hourly { format_2h_block(timestamp_ms) } else { format_day(timestamp_ms) };
-        let model = payload.model_id.as_deref().unwrap_or("unknown").to_string();
-        let provider = payload
-            .provider_id
-            .as_deref()
-            .unwrap_or("unknown")
-            .to_string();
-
-        // Collect interval for runtime_dedup
-        let interval = if metrics.runtime > 0 {
-            if let Some(t) = time_info {
-                let created = t.created.unwrap_or(0);
-                let completed = t.completed.unwrap_or(0);
-                if created > 0 && completed > 0 {
-                    Some((created, completed))
-                } else {
-                    None
-                }
-            } else {
-                None
-            }
-        } else {
-            None
-        };
-
-        first_day = Some(first_day.unwrap_or_else(|| format_day(timestamp_ms)));
-        last_day = Some(format_day(timestamp_ms));
-
-        assistant_entries.push(AssistantEntry {
-            session_id,
-            ts_ms: timestamp_ms,
-            bucket,
-            heatmap_bucket,
-            model,
-            provider,
-            metrics,
-            interval,
-        });
-    }
-
-    drop(stmt);
-
-    // Collect per-session compaction timestamps. A compaction rewrites the
-    // context, so a pair spanning one has no valid cache baseline — it must be
-    // broken. Compactions live in session_message (type='compaction'); content
-    // messages (assistant/user) are in the `message` table.
-    let compaction_times: HashMap<String, Vec<i64>> = {
-        let mut map: HashMap<String, Vec<i64>> = HashMap::new();
-        let mut stmt = conn
-            .prepare(
-                "SELECT sm.session_id, sm.time_created FROM session_message sm \
-                 JOIN session s ON sm.session_id = s.id \
-                 WHERE sm.type = 'compaction' \
-                 AND s.directory NOT LIKE '%.opencode%' \
-                 AND s.directory NOT LIKE '/home/hmsy/.config/pet%'",
-            )
-            .map_err(|e| format!("查询 compaction 消息失败: {e}"))?;
-        let rows = stmt
-            .query_map([], |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
-            })
-            .map_err(|e| format!("执行查询失败: {e}"))?;
-        for row in rows {
-            if let Ok((sid, ts)) = row {
-                map.entry(sid).or_default().push(ts);
-            }
-        }
-        for v in map.values_mut() {
-            v.sort_unstable();
-        }
-        map
-    };
-
-    // Pair consecutive messages within each session to compute cache miss counters.
-    pair_cache_miss(&mut assistant_entries, &compaction_times);
 
     // Get user message IDs that have at least one non-synthetic text/file part.
     // Messages whose ALL text/file parts are synthetic (or have no text/file parts at all)
@@ -1099,6 +1119,425 @@ fn rusqlite_connection(db_path: &Path) -> Result<rusqlite::Connection, String> {
         .map_err(|e| format!("打开数据库失败: {e}"))
 }
 
+// ── Cache-miss drill-down ──────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CacheMissSessionRow {
+    session_id: String,
+    title: String,
+    provider: String,
+    model: String,
+    cache_miss: i64,
+    cache_expected: i64,
+    miss_rate: f64,
+    pairs: i64,
+    first_time: i64,
+    last_time: i64,
+    /// True when every pair in this session read nothing from cache
+    /// (i.e. the provider/model does not support prompt caching).
+    no_cache: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CacheMissSessionsPayload {
+    range: String,
+    total_miss: i64,
+    total_expected: i64,
+    sessions: Vec<CacheMissSessionRow>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CacheMissMessage {
+    id: String,
+    idx: usize,
+    ts: i64,
+    total: i64,
+    cache_read: i64,
+    cache_write: i64,
+    input: i64,
+    output: i64,
+    reasoning: i64,
+    /// Previous message's total (the context that should have been cached).
+    /// None for the first real message or a broken pair.
+    prev_total: Option<i64>,
+    /// max(0, prev_total - cache_read). None when prev_total is None.
+    miss: Option<i64>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CacheMissSessionDetail {
+    session_id: String,
+    title: String,
+    provider: String,
+    model: String,
+    no_cache: bool,
+    messages: Vec<CacheMissMessage>,
+}
+
+/// Per-session cache-miss aggregation for the selected range.
+fn aggregate_cache_miss_sessions(
+    db_path: &Path,
+    range_value: Option<&str>,
+    date_filter: Option<&str>,
+    provider_filter: Option<&str>,
+    model_filter: Option<&str>,
+) -> Result<CacheMissSessionsPayload, String> {
+    let conn = rusqlite_connection(db_path)?;
+    let (mut entries, first_day, last_day, _scanned) = load_assistant_entries(&conn, false, false)?;
+    let compaction_times = load_compaction_times(&conn)?;
+    pair_cache_miss(&mut entries, &compaction_times);
+
+    // The range window is only used when no exact date filter is given.
+    let (sel_first, sel_last) = if date_filter.is_some() {
+        (None, None)
+    } else {
+        resolve_day_window(first_day.as_deref(), last_day.as_deref(), range_value)
+    };
+
+    // session titles
+    let mut titles: HashMap<String, String> = HashMap::new();
+    {
+        let mut stmt = conn
+            .prepare("SELECT id, title FROM session")
+            .map_err(|e| format!("查询 session 失败: {e}"))?;
+        let rows = stmt
+            .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))
+            .map_err(|e| format!("执行查询失败: {e}"))?;
+        for r in rows {
+            if let Ok((id, t)) = r {
+                titles.insert(id, t);
+            }
+        }
+    }
+
+    struct SessAgg {
+        miss: i64,
+        expected: i64,
+        cache_read: i64,
+        pairs: i64,
+        first: i64,
+        last: i64,
+        provider: String,
+        model: String,
+    }
+    let mut agg: HashMap<String, SessAgg> = HashMap::new();
+
+    // Only "cur" entries (cache_expected > 0 = was paired as a successor) carry
+    // miss/expected. Attribute them to their session, filtered by date / range /
+    // provider / model as requested.
+    for e in &entries {
+        if e.metrics.cache_expected == 0 {
+            continue;
+        }
+        let day = format_day(e.ts_ms);
+        if let Some(d) = date_filter {
+            if day.as_str() != d {
+                continue;
+            }
+        } else {
+            if let Some(ref f) = sel_first {
+                if day.as_str() < f.as_str() {
+                    continue;
+                }
+            }
+            if let Some(ref l) = sel_last {
+                if day.as_str() > l.as_str() {
+                    continue;
+                }
+            }
+        }
+        if let Some(p) = provider_filter {
+            if e.provider != p {
+                continue;
+            }
+        }
+        if let Some(m) = model_filter {
+            if e.model != m {
+                continue;
+            }
+        }
+        let s = agg.entry(e.session_id.clone()).or_insert_with(|| SessAgg {
+            miss: 0,
+            expected: 0,
+            cache_read: 0,
+            pairs: 0,
+            first: e.ts_ms,
+            last: e.ts_ms,
+            provider: e.provider.clone(),
+            model: e.model.clone(),
+        });
+        s.miss += e.metrics.cache_miss;
+        s.expected += e.metrics.cache_expected;
+        s.cache_read += e.metrics.cache_read;
+        s.pairs += 1;
+        if e.ts_ms < s.first {
+            s.first = e.ts_ms;
+        }
+        if e.ts_ms > s.last {
+            s.last = e.ts_ms;
+        }
+    }
+
+    let mut rows: Vec<CacheMissSessionRow> = Vec::new();
+    let mut total_miss = 0i64;
+    let mut total_expected = 0i64;
+    for (sid, s) in agg.into_iter() {
+        total_miss += s.miss;
+        total_expected += s.expected;
+        let miss_rate = if s.expected > 0 {
+            ((s.miss as f64 / s.expected as f64) * 1000.0).round() / 10.0
+        } else {
+            0.0
+        };
+        let no_cache = s.pairs > 0 && s.cache_read == 0;
+        rows.push(CacheMissSessionRow {
+            session_id: sid.clone(),
+            title: titles.get(&sid).cloned().unwrap_or_default(),
+            provider: s.provider,
+            model: s.model,
+            cache_miss: s.miss,
+            cache_expected: s.expected,
+            miss_rate,
+            pairs: s.pairs,
+            first_time: s.first,
+            last_time: s.last,
+            no_cache,
+        });
+    }
+    rows.sort_by(|a, b| b.cache_miss.cmp(&a.cache_miss));
+
+    Ok(CacheMissSessionsPayload {
+        range: range_value.unwrap_or("all").to_string(),
+        total_miss,
+        total_expected,
+        sessions: rows,
+    })
+}
+
+/// Per-message cache-miss lifecycle for a single session.
+fn aggregate_cache_miss_session_detail(
+    db_path: &Path,
+    session_id: &str,
+) -> Result<CacheMissSessionDetail, String> {
+    let conn = rusqlite_connection(db_path)?;
+    let (title, dir): (String, String) = conn
+        .query_row(
+            "SELECT title, directory FROM session WHERE id = ?",
+            rusqlite::params![session_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .map_err(|e| format!("会话不存在: {e}"))?;
+    if dir.contains(".opencode") || dir.starts_with("/home/hmsy/.config/pet") {
+        return Err("会话不在统计范围内".into());
+    }
+
+    // Load only this session's assistant messages (focused query — cheap).
+    let mut stmt = conn
+        .prepare(
+            "SELECT m.id, m.data FROM message m \
+             JOIN session s ON m.session_id = s.id \
+             WHERE m.session_id = ? AND m.data LIKE '%\"role\":\"assistant\"%' \
+             AND s.directory NOT LIKE '%.opencode%' \
+             AND s.directory NOT LIKE '/home/hmsy/.config/pet%' \
+             ORDER BY m.time_created ASC",
+        )
+        .map_err(|e| format!("查询失败: {e}"))?;
+    let mut entries: Vec<AssistantEntry> = Vec::new();
+    let rows = stmt
+        .query_map(rusqlite::params![session_id], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })
+        .map_err(|e| format!("执行查询失败: {e}"))?;
+    for row in rows {
+        let (id, raw) = match row {
+            Ok(r) => r,
+            Err(_) => continue,
+        };
+        let payload: MessageData = match serde_json::from_str(&raw) {
+            Ok(p) => p,
+            Err(_) => continue,
+        };
+        if payload.role.as_deref() != Some("assistant") {
+            continue;
+        }
+        let time_info = payload.time.as_ref();
+        let ts = time_info.and_then(|t| t.completed.or(t.created)).unwrap_or(0);
+        if ts == 0 {
+            continue;
+        }
+        let metrics = extract_metrics(payload.tokens.as_ref(), time_info, false);
+        let model = payload.model_id.as_deref().unwrap_or("unknown").to_string();
+        let provider = payload.provider_id.as_deref().unwrap_or("unknown").to_string();
+        entries.push(AssistantEntry {
+            id,
+            session_id: session_id.to_string(),
+            ts_ms: ts,
+            bucket: String::new(),
+            heatmap_bucket: String::new(),
+            model,
+            provider,
+            metrics,
+            interval: None,
+        });
+    }
+    let compaction_times = load_compaction_times(&conn)?;
+    pair_cache_miss(&mut entries, &compaction_times);
+
+    // Emit non-zero messages in time order (pair_cache_miss already sorted).
+    let mut messages: Vec<CacheMissMessage> = Vec::new();
+    let mut max_cache_read: i64 = 0;
+    let mut first_provider = String::new();
+    let mut first_model = String::new();
+    let mut nz = 0usize;
+    for e in &entries {
+        if e.metrics.total == 0 {
+            continue; // excluded: aborted/errored before any response
+        }
+        if first_provider.is_empty() {
+            first_provider = e.provider.clone();
+            first_model = e.model.clone();
+        }
+        if e.metrics.cache_read > max_cache_read {
+            max_cache_read = e.metrics.cache_read;
+        }
+        let paired = e.metrics.cache_expected > 0;
+        messages.push(CacheMissMessage {
+            id: e.id.clone(),
+            idx: nz,
+            ts: e.ts_ms,
+            total: e.metrics.total,
+            cache_read: e.metrics.cache_read,
+            cache_write: e.metrics.cache_write,
+            input: e.metrics.input,
+            output: e.metrics.output,
+            reasoning: e.metrics.reasoning,
+            prev_total: if paired { Some(e.metrics.cache_expected) } else { None },
+            miss: if paired { Some(e.metrics.cache_miss) } else { None },
+        });
+        nz += 1;
+    }
+    let no_cache = !messages.is_empty() && max_cache_read == 0;
+
+    Ok(CacheMissSessionDetail {
+        session_id: session_id.to_string(),
+        title,
+        provider: first_provider,
+        model: first_model,
+        no_cache,
+        messages,
+    })
+}
+
+// ── Single message content (parts) ─────────────────────────────────────────
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct MessageContentPart {
+    /// "text" | "reasoning" | "tool"
+    #[serde(rename = "type")]
+    part_type: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    text: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    status: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    title: Option<String>,
+    /// Tool args, stringified JSON.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    input: Option<String>,
+    /// Tool output text.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    output: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct MessageContentPayload {
+    message_id: String,
+    parts: Vec<MessageContentPart>,
+}
+
+/// Fetch the rendered content (parts) of a single assistant message.
+fn get_message_content(db_path: &Path, message_id: &str) -> Result<MessageContentPayload, String> {
+    let conn = rusqlite_connection(db_path)?;
+    // Verify it's an assistant message in a non-excluded session.
+    let dir: String = conn
+        .query_row(
+            "SELECT s.directory FROM message m JOIN session s ON m.session_id = s.id \
+             WHERE m.id = ? AND m.data LIKE '%\"role\":\"assistant\"%'",
+            rusqlite::params![message_id],
+            |row| row.get(0),
+        )
+        .map_err(|e| format!("消息不存在或非 assistant: {e}"))?;
+    if dir.contains(".opencode") || dir.starts_with("/home/hmsy/.config/pet") {
+        return Err("消息不在统计范围内".into());
+    }
+
+    let mut stmt = conn
+        .prepare("SELECT data FROM part WHERE message_id = ? ORDER BY time_created ASC, id ASC")
+        .map_err(|e| format!("查询 part 失败: {e}"))?;
+    let rows = stmt
+        .query_map(rusqlite::params![message_id], |row| row.get::<_, String>(0))
+        .map_err(|e| format!("执行查询失败: {e}"))?;
+
+    let mut parts: Vec<MessageContentPart> = Vec::new();
+    for raw in rows {
+        let raw = match raw {
+            Ok(r) => r,
+            Err(_) => continue,
+        };
+        let v: serde_json::Value = match serde_json::from_str(&raw) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        let part_type = v.get("type").and_then(|t| t.as_str()).unwrap_or("").to_string();
+        match part_type.as_str() {
+            "text" | "reasoning" => {
+                let text = v.get("text").and_then(|t| t.as_str()).map(|s| s.to_string());
+                parts.push(MessageContentPart { part_type, text, name: None, status: None, title: None, input: None, output: None, error: None });
+            }
+            "tool" => {
+                let name = v.get("tool").and_then(|t| t.as_str()).map(|s| s.to_string());
+                let state = v.get("state");
+                let status = state.and_then(|s| s.get("status")).and_then(|s| s.as_str()).map(|s| s.to_string());
+                let title = state.and_then(|s| s.get("title")).and_then(|s| s.as_str()).map(|s| s.to_string());
+                let input = state.and_then(|s| s.get("input")).map(|i| i.to_string());
+                let output = state
+                    .and_then(|s| s.get("output"))
+                    .and_then(|s| s.as_str())
+                    .map(|s| s.to_string())
+                    .or_else(|| {
+                        state
+                            .and_then(|s| s.get("metadata"))
+                            .and_then(|m| m.get("output"))
+                            .and_then(|o| o.as_str())
+                            .map(|s| s.to_string())
+                    });
+                let error = state
+                    .and_then(|s| s.get("error"))
+                    .and_then(|e| e.get("message"))
+                    .and_then(|m| m.as_str())
+                    .map(|s| s.to_string());
+                parts.push(MessageContentPart { part_type, text: None, name, status, title, input, output, error });
+            }
+            _ => {} // skip step-start / step-finish / other markers
+        }
+    }
+
+    Ok(MessageContentPayload {
+        message_id: message_id.to_string(),
+        parts,
+    })
+}
+
 // ── Cache helpers ──────────────────────────────────────────────────────────
 
 async fn get_usage_payload(
@@ -1176,6 +1615,82 @@ async fn api_usage(
         Ok(payload) => Json(payload).into_response(),
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": e })),
+        )
+            .into_response(),
+    }
+}
+
+async fn api_cache_miss_sessions(
+    Query(params): Query<CacheMissQuery>,
+) -> impl IntoResponse {
+    let range_value = params.range.as_deref();
+    let db_path = match discover_database() {
+        Ok(p) => p,
+        Err(e) => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({ "error": e })),
+            )
+                .into_response();
+        }
+    };
+    match aggregate_cache_miss_sessions(
+        &db_path,
+        range_value,
+        params.date.as_deref(),
+        params.provider.as_deref(),
+        params.model.as_deref(),
+    ) {
+        Ok(payload) => Json(payload).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": e })),
+        )
+            .into_response(),
+    }
+}
+
+async fn api_cache_miss_session_detail(
+    axum::extract::Path(session_id): axum::extract::Path<String>,
+) -> impl IntoResponse {
+    let db_path = match discover_database() {
+        Ok(p) => p,
+        Err(e) => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({ "error": e })),
+            )
+                .into_response();
+        }
+    };
+    match aggregate_cache_miss_session_detail(&db_path, &session_id) {
+        Ok(payload) => Json(payload).into_response(),
+        Err(e) => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "error": e })),
+        )
+            .into_response(),
+    }
+}
+
+async fn api_cache_miss_message(
+    axum::extract::Path(message_id): axum::extract::Path<String>,
+) -> impl IntoResponse {
+    let db_path = match discover_database() {
+        Ok(p) => p,
+        Err(e) => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({ "error": e })),
+            )
+                .into_response();
+        }
+    };
+    match get_message_content(&db_path, &message_id) {
+        Ok(payload) => Json(payload).into_response(),
+        Err(e) => (
+            StatusCode::NOT_FOUND,
             Json(serde_json::json!({ "error": e })),
         )
             .into_response(),
@@ -1278,6 +1793,9 @@ async fn main() {
     let app = axum::Router::new()
         .route("/health", get(health))
         .route("/api/usage", get(api_usage))
+        .route("/api/cache-miss/sessions", get(api_cache_miss_sessions))
+        .route("/api/cache-miss/session/{id}", get(api_cache_miss_session_detail))
+        .route("/api/cache-miss/message/{id}", get(api_cache_miss_message))
         .fallback(spa_fallback)
         .layer(CorsLayer::permissive())
         .with_state(state);
