@@ -310,6 +310,9 @@ struct AssistantEntry {
 /// cache baseline for cur:
 ///   - different session (always)
 ///   - different model or provider (different cache namespace)
+///   - prev is a cold start (cache_read == 0): its context was never in the
+///     cache, so cur not reading it isn't a real miss. Covers session first
+///     messages, post-compaction first messages, and non-caching providers.
 ///   - a compaction occurred strictly between prev and cur (context rewritten)
 /// Zero-token messages (aborted/errored before any response) are excluded from
 /// pairing entirely — neither as cur nor as prev. As a cur they'd yield
@@ -333,6 +336,12 @@ fn pair_cache_miss(entries: &mut [AssistantEntry], compactions: &HashMap<String,
             || cur.model != prev.model
             || cur.provider != prev.provider
         {
+            continue;
+        }
+        // Skip if prev was a cold start (cache_read == 0): its context was never
+        // in the cache, so cur not reading it isn't a real miss. Covers session
+        // first messages, post-compaction first messages, and non-caching providers.
+        if prev.metrics.cache_read == 0 {
             continue;
         }
         // Break if a compaction happened strictly between prev and cur.
@@ -692,9 +701,9 @@ fn load_compaction_times(conn: &rusqlite::Connection) -> Result<HashMap<String, 
     let mut map: HashMap<String, Vec<i64>> = HashMap::new();
     let mut stmt = conn
         .prepare(
-            "SELECT sm.session_id, sm.time_created FROM session_message sm \
-             JOIN session s ON sm.session_id = s.id \
-             WHERE sm.type = 'compaction' \
+            "SELECT p.session_id, p.time_created FROM part p \
+             JOIN session s ON p.session_id = s.id \
+             WHERE json_extract(p.data, '$.type') = 'compaction' \
              AND s.directory NOT LIKE '%.opencode%' \
              AND s.directory NOT LIKE '/home/hmsy/.config/pet%'",
         )

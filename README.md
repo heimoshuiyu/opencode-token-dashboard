@@ -138,6 +138,7 @@ opencode-token-dashboard/
 在同一会话内，取**时间相邻**的两条 assistant 消息 `(prev → cur)`，当同时满足：
 
 - 同一 model、同一 provider（缓存按模型 / 服务商隔离）
+- `prev.cache_read > 0`（prev 不是冷启动——冷启动的上下文从未进缓存，cur 读不到不算 miss；覆盖会话首条、压缩后首条、以及完全不缓存的 provider）
 - 两者之间没有发生 compaction（压缩会重写上下文）
 - 两条消息都有真实 token 用量（排除被中止 / 出错、token 全为 0 的消息）
 
