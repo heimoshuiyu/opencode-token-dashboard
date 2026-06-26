@@ -306,8 +306,7 @@ function SessionDetail({ sessionId, onBack, onSelectMessage }: { sessionId: stri
               <TableHead className="text-right">{t("chart.columnTotal")}</TableHead>
               <TableHead className="text-right">cache_read</TableHead>
               <TableHead className="text-right">input</TableHead>
-              <TableHead className="text-right">{t("chart.columnOutput")}</TableHead>
-              <TableHead className="text-right">{t("chart.columnReasoning")}</TableHead>
+              <TableHead className="text-right">{t("chart.columnOutputReasoning")}</TableHead>
               <TableHead className="text-right">{t("chart.columnExpected")}</TableHead>
               <TableHead className="pr-5 text-right">{t("chart.columnMissTokens")}</TableHead>
             </TableRow>
@@ -333,10 +332,7 @@ function SessionDetail({ sessionId, onBack, onSelectMessage }: { sessionId: stri
                     {formatNumber(m.input, locale)}
                   </TableCell>
                   <TableCell className="text-right font-mono text-[11px] text-muted-foreground">
-                    {formatNumber(m.output, locale)}
-                  </TableCell>
-                  <TableCell className="text-right font-mono text-[11px] text-muted-foreground">
-                    {formatNumber(m.reasoning, locale)}
+                    {formatNumber(m.output + m.reasoning, locale)}
                   </TableCell>
                   <TableCell className="text-right font-mono text-[11px] text-muted-foreground">
                     {m.prevTotal != null ? formatNumber(m.prevTotal, locale) : "—"}

@@ -86,8 +86,7 @@ export interface Translations {
     columnMissRate: string;
     columnPairs: string;
     columnGap: string;
-    columnOutput: string;
-    columnReasoning: string;
+    columnOutputReasoning: string;
     columnTotal: string;
     columnTime: string;
     lifecycleChart: string;
