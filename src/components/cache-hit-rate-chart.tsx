@@ -13,7 +13,7 @@ import {
 } from "@/components/ui/chart";
 import type { ProviderModelTrendEntry } from "@/types";
 import type { Locale } from "@/lib/i18n";
-import { formatCompact, formatDateLabel, formatNumber } from "@/lib/format";
+import { formatCompact, formatDateLabel, formatNumber, formatAxisValue } from "@/lib/format";
 import { useLocale } from "@/lib/i18n";
 import {
   Card,
@@ -37,7 +37,7 @@ interface SeriesItem {
   model: string;
   color: string;
   totalTokens: number;
-  dayMap: Map<string, { input: number; cache_read: number; cache_write: number }>;
+  dayMap: Map<string, { cache_miss: number }>;
 }
 
 interface ChartDataRow {
@@ -49,6 +49,7 @@ interface ChartDataRow {
 // ── Palette ──────────────────────────────────────────────────────────────
 
 const LINE_COLORS = [
+  "#f87171",
   "#34d399",
   "#22d3ee",
   "#a78bfa",
@@ -58,21 +59,12 @@ const LINE_COLORS = [
   "#4ade80",
   "#38bdf8",
   "#c084fc",
-  "#f87171",
   "#818cf8",
   "#2dd4bf",
   "#e879f9",
   "#a3e635",
   "#f43f5e",
 ];
-
-// ── Helpers ──────────────────────────────────────────────────────────────
-
-function computeHitRate(input: number, cacheRead: number, cacheWrite: number): number {
-  const inputTotal = input + cacheRead + cacheWrite;
-  if (inputTotal === 0) return 0;
-  return Math.round(((cacheRead + cacheWrite) / inputTotal) * 1000) / 10;
-}
 
 // ── Custom Tooltip ───────────────────────────────────────────────────────
 
@@ -108,12 +100,7 @@ function CacheTooltip(props: {
           const key = entry.dataKey || "";
           const s = series.find((item) => item.key === key);
           if (!s) return null;
-          const row = entry.payload;
-          const inputTotal = (row?.[`${key}_input`] as number) || 0;
-          const cached = (row?.[`${key}_cached`] as number) || 0;
-          const cacheRead = (row?.[`${key}_cacheRead`] as number) || 0;
-          const cacheWrite = (row?.[`${key}_cacheWrite`] as number) || 0;
-          const hitRate = entry.value || 0;
+          const missed = entry.value || 0;
 
           return (
             <div key={key} className="flex flex-col gap-0.5">
@@ -128,24 +115,8 @@ function CacheTooltip(props: {
               </div>
               <div className="ml-4 flex flex-col gap-0">
                 <span className="font-mono text-xs font-semibold text-foreground">
-                  {hitRate.toFixed(1)}% {t("chart.cacheHitRate")}
+                  {t("chart.missedTokens")}: {formatCompact(missed, locale)} ({formatNumber(missed, locale)})
                 </span>
-                <span className="text-[11px] text-muted-foreground">
-                  {t("chart.inputTokens")}: {formatCompact(inputTotal, locale)} ({formatNumber(inputTotal, locale)})
-                </span>
-                <span className="text-[11px] text-muted-foreground">
-                  {t("chart.cachedTokens")}: {formatCompact(cached, locale)} ({formatNumber(cached, locale)})
-                </span>
-                {cacheRead > 0 && (
-                  <span className="text-[11px] text-muted-foreground">
-                    cache_read: {formatCompact(cacheRead, locale)}
-                  </span>
-                )}
-                {cacheWrite > 0 && (
-                  <span className="text-[11px] text-muted-foreground">
-                    cache_write: {formatCompact(cacheWrite, locale)}
-                  </span>
-                )}
               </div>
             </div>
           );
@@ -187,9 +158,7 @@ export function CacheHitRateChart({ trends, loading }: CacheHitRateChartProps) {
         tr.days.map((d) => [
           d.date,
           {
-            input: d.input || 0,
-            cache_read: d.cache_read || 0,
-            cache_write: d.cache_write || 0,
+            cache_miss: d.cache_miss || 0,
           },
         ])
       );
@@ -235,12 +204,7 @@ export function CacheHitRateChart({ trends, loading }: CacheHitRateChartProps) {
       for (const s of series) {
         const day = s.dayMap.get(date);
         if (day) {
-          const hitRate = computeHitRate(day.input, day.cache_read, day.cache_write);
-          row[s.key] = hitRate;
-          row[`${s.key}_input`] = day.input + day.cache_read + day.cache_write;
-          row[`${s.key}_cached`] = day.cache_read + day.cache_write;
-          row[`${s.key}_cacheRead`] = day.cache_read;
-          row[`${s.key}_cacheWrite`] = day.cache_write;
+          row[s.key] = day.cache_miss;
         } else {
           row[s.key] = undefined;
         }
@@ -283,10 +247,10 @@ export function CacheHitRateChart({ trends, loading }: CacheHitRateChartProps) {
           Performance
         </p>
         <CardTitle className="text-base font-semibold">
-          {t("chart.cacheHitRateTitle")}
+          {t("chart.cacheMissTitle")}
         </CardTitle>
         <CardDescription className="text-xs">
-          {t("chart.cacheHitRateDesc")}
+          {t("chart.cacheMissDesc")}
         </CardDescription>
       </CardHeader>
       <CardContent>
@@ -321,9 +285,9 @@ export function CacheHitRateChart({ trends, loading }: CacheHitRateChartProps) {
               axisLine={false}
               tickMargin={6}
               tick={{ fill: "var(--muted-foreground)", fontSize: 11 }}
-              tickFormatter={(v: number) => `${v}%`}
-              domain={[0, 100]}
-              width={44}
+              tickFormatter={(v: number) => formatAxisValue(v, locale)}
+              domain={[0, "auto"]}
+              width={48}
             />
             <ChartTooltip
               content={

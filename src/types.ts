@@ -6,6 +6,8 @@ export interface MetricSummary {
   reasoning: number;
   cache_read: number;
   cache_write: number;
+  cache_miss: number;
+  cache_expected: number;
   cache_hit_rate: number;
   runtime: number;
   runtime_dedup: number;
@@ -94,6 +96,8 @@ export const METRIC_META: Record<MetricKey, MetricMeta> = {
   reasoning: { label: "reasoning", color: "#ff8cc6" },
   cache_read: { label: "cache_read", color: "#9e8cff" },
   cache_write: { label: "cache_write", color: "#ff9e6e" },
+  cache_miss: { label: "cache_miss", color: "#f87171" },
+  cache_expected: { label: "cache_expected", color: "#fbbf24" },
   cache_hit_rate: { label: "cache_hit_rate", color: "#34d399" },
   runtime: { label: "runtime", color: "#ff6b9d" },
   runtime_dedup: { label: "runtime_dedup", color: "#c084fc" },
@@ -129,6 +133,7 @@ export const METRIC_OPTIONS: { value: MetricKey }[] = [
   { value: "cache_read" },
   { value: "cache_write" },
   { value: "cache_hit_rate" },
+  { value: "cache_miss" },
   { value: "user_message_count" },
   { value: "runtime" },
   { value: "runtime_dedup" },

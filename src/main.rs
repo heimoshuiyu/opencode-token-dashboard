@@ -56,6 +56,8 @@ pub struct Metrics {
     reasoning: i64,
     cache_read: i64,
     cache_write: i64,
+    cache_miss: i64,
+    cache_expected: i64,
     runtime: i64,
     runtime_dedup: i64,
     user_message_count: i64,
@@ -70,6 +72,8 @@ impl Metrics {
         self.reasoning += other.reasoning;
         self.cache_read += other.cache_read;
         self.cache_write += other.cache_write;
+        self.cache_miss += other.cache_miss;
+        self.cache_expected += other.cache_expected;
         self.runtime += other.runtime;
         self.runtime_dedup += other.runtime_dedup;
         self.user_message_count += other.user_message_count;
@@ -261,9 +265,75 @@ fn extract_metrics(tokens: Option<&TokenData>, time: Option<&TimeData>, skip_run
         reasoning,
         cache_read,
         cache_write,
+        cache_miss: 0,
+        cache_expected: 0,
         runtime,
         runtime_dedup: 0,
         user_message_count: 0,
+    }
+}
+
+/// One assistant message, carrying everything needed for aggregation plus the
+/// session id + timestamp required to pair consecutive messages.
+struct AssistantEntry {
+    session_id: String,
+    ts_ms: i64,
+    bucket: String,
+    heatmap_bucket: String,
+    model: String,
+    provider: String,
+    metrics: Metrics,
+    interval: Option<(i64, i64)>,
+}
+
+/// Pair consecutive assistant messages within each session (ordered by time)
+/// and compute cache miss / expected counters, attributed to the successor.
+///
+/// For a pair (prev → cur) in the same session:
+///   expected = prev.total   (the full context that should carry over)
+///   miss     = max(0, prev.total - cur.cache_read)
+/// Both are additive token counters; aggregation sums them naturally.
+///
+/// A pair is BROKEN (cur not counted) when the previous context is not a valid
+/// cache baseline for cur:
+///   - different session (always)
+///   - different model or provider (different cache namespace)
+///   - a compaction occurred strictly between prev and cur (context rewritten)
+/// Zero-token messages (aborted/errored before any response) are excluded from
+/// pairing entirely — neither as cur nor as prev. As a cur they'd yield
+/// miss = prev.total (a false positive); as a prev they'd zero out the next
+/// pair's baseline. The remaining real messages pair across the gap.
+/// `compactions` maps session_id → sorted compaction timestamps (epoch ms).
+fn pair_cache_miss(entries: &mut [AssistantEntry], compactions: &HashMap<String, Vec<i64>>) {
+    // Stable sort restores per-session time order (the SQL already returns
+    // time-ordered rows, but grouping by session requires this).
+    entries.sort_by(|a, b| a.session_id.cmp(&b.session_id).then(a.ts_ms.cmp(&b.ts_ms)));
+    // Indices of messages with real token usage (total > 0).
+    let nonzero: Vec<usize> = (0..entries.len())
+        .filter(|&i| entries[i].metrics.total > 0)
+        .collect();
+    for k in 1..nonzero.len() {
+        let (pi, ci) = (nonzero[k - 1], nonzero[k]);
+        let prev = &entries[pi];
+        let cur = &entries[ci];
+        // Break across session / model / provider boundaries.
+        if cur.session_id != prev.session_id
+            || cur.model != prev.model
+            || cur.provider != prev.provider
+        {
+            continue;
+        }
+        // Break if a compaction happened strictly between prev and cur.
+        if compactions
+            .get(&cur.session_id)
+            .is_some_and(|times| times.iter().any(|&c| c > prev.ts_ms && c < cur.ts_ms))
+        {
+            continue;
+        }
+        let prev_total = prev.metrics.total;
+        let cur_read = cur.metrics.cache_read;
+        entries[ci].metrics.cache_expected = prev_total;
+        entries[ci].metrics.cache_miss = (prev_total - cur_read).max(0);
     }
 }
 
@@ -516,8 +586,8 @@ fn aggregate_usage(db_path: &Path, range_value: Option<&str>) -> Result<UsagePay
     let mut heatmap_totals: HashMap<String, Metrics> = HashMap::new();
     let mut heatmap_user_messages: HashMap<String, i64> = HashMap::new();
 
-    // (bucket, model, provider, metrics, interval, heatmap_bucket)
-    let mut assistant_entries: Vec<(String, String, String, Metrics, Option<(i64, i64)>, String)> = Vec::new();
+    // Collected assistant messages; pairing for cache-miss happens after the loop.
+    let mut assistant_entries: Vec<AssistantEntry> = Vec::new();
 
     let mut first_day: Option<String> = None;
     let mut last_day: Option<String> = None;
@@ -609,10 +679,53 @@ fn aggregate_usage(db_path: &Path, range_value: Option<&str>) -> Result<UsagePay
         first_day = Some(first_day.unwrap_or_else(|| format_day(timestamp_ms)));
         last_day = Some(format_day(timestamp_ms));
 
-        assistant_entries.push((bucket, model, provider, metrics, interval, heatmap_bucket));
+        assistant_entries.push(AssistantEntry {
+            session_id,
+            ts_ms: timestamp_ms,
+            bucket,
+            heatmap_bucket,
+            model,
+            provider,
+            metrics,
+            interval,
+        });
     }
 
     drop(stmt);
+
+    // Collect per-session compaction timestamps. A compaction rewrites the
+    // context, so a pair spanning one has no valid cache baseline — it must be
+    // broken. Compactions live in session_message (type='compaction'); content
+    // messages (assistant/user) are in the `message` table.
+    let compaction_times: HashMap<String, Vec<i64>> = {
+        let mut map: HashMap<String, Vec<i64>> = HashMap::new();
+        let mut stmt = conn
+            .prepare(
+                "SELECT sm.session_id, sm.time_created FROM session_message sm \
+                 JOIN session s ON sm.session_id = s.id \
+                 WHERE sm.type = 'compaction' \
+                 AND s.directory NOT LIKE '%.opencode%' \
+                 AND s.directory NOT LIKE '/home/hmsy/.config/pet%'",
+            )
+            .map_err(|e| format!("查询 compaction 消息失败: {e}"))?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+            })
+            .map_err(|e| format!("执行查询失败: {e}"))?;
+        for row in rows {
+            if let Ok((sid, ts)) = row {
+                map.entry(sid).or_default().push(ts);
+            }
+        }
+        for v in map.values_mut() {
+            v.sort_unstable();
+        }
+        map
+    };
+
+    // Pair consecutive messages within each session to compute cache miss counters.
+    pair_cache_miss(&mut assistant_entries, &compaction_times);
 
     // Get user message IDs that have at least one non-synthetic text/file part.
     // Messages whose ALL text/file parts are synthetic (or have no text/file parts at all)
@@ -714,7 +827,8 @@ fn aggregate_usage(db_path: &Path, range_value: Option<&str>) -> Result<UsagePay
     let mut all_intervals: Vec<(i64, i64)> = Vec::new();
     let mut assistant_rows: i64 = 0;
 
-    for (bucket, model, provider, metrics, interval, heatmap_bucket) in &assistant_entries {
+    for entry in &assistant_entries {
+        let AssistantEntry { bucket, model, provider, metrics, interval, heatmap_bucket, .. } = entry;
         // For hourly: bucket is "2026-05-30T14", we need the day part for window check
         let bucket_day = if hourly {
             bucket.split_once('T').map(|(d, _)| d).unwrap_or(bucket.as_str())

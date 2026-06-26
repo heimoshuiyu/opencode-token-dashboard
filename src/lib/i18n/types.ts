@@ -56,8 +56,11 @@ export interface Translations {
     cacheHitRateTitle: string;
     cacheHitRateDesc: string;
     cacheHitRate: string;
+    cacheMissTitle: string;
+    cacheMissDesc: string;
     inputTokens: string;
     cachedTokens: string;
+    missedTokens: string;
     clickToSolo: string;
     clickToShowAll: string;
     heatmapTitle: string;
@@ -84,6 +87,7 @@ export interface Translations {
     cache_read: string;
     cache_write: string;
     cache_hit_rate: string;
+    cache_miss: string;
     runtime: string;
     runtime_dedup: string;
     user_message_count: string;
