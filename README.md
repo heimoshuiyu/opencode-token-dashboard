@@ -8,7 +8,7 @@
 
 ### 缓存未命中下钻
 
-![缓存未命中下钻](<!-- TODO: 替换为缓存未命中 tokens 下钻对话框截图 -->)
+![缓存未命中下钻](https://github.com/heimoshuiyu/opencode-token-dashboard/releases/download/v1.3.0/session-detail-light.png)
 
 ## 功能
 
