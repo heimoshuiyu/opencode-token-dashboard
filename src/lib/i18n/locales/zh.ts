@@ -60,6 +60,11 @@ export const zh: Translations = {
     cachedTokens: "缓存 Tokens",
     clickToSolo: "点击单独查看此模型",
     clickToShowAll: "点击显示全部",
+    heatmapTitle: "活跃度热力图",
+    heatmapDesc: "{metric} 活跃度，颜色越深越活跃",
+    heatmapLess: "少",
+    heatmapMore: "多",
+    heatmapTotal: "合计",
   },
   range: {
     last7: "最近 7 天",

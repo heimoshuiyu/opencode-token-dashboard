@@ -39,6 +39,20 @@ export interface ProviderModelTrendEntry {
   days: ProviderModelDayEntry[];
 }
 
+export type HeatmapGranularity = "hourly" | "daily";
+
+export interface HeatmapPayload {
+  /** Bucket type: "hourly" (≤ 90 days, 2-hour blocks) or "daily" (> 90 days). */
+  granularity: HeatmapGranularity;
+  /** Time span of one heat point in hours: 2 (hourly) or 24 (daily). */
+  intervalHours: number;
+  /**
+   * Heat-point series. Hourly entries: "YYYY-MM-DDTHH" where HH is a 2-hour
+   * block start (00/02/…/22, 12 per day). Daily entries: "YYYY-MM-DD".
+   */
+  data: DayEntry[];
+}
+
 export interface Meta {
   database: string;
   databasePath: string;
@@ -61,6 +75,8 @@ export interface UsagePayload {
   providers: ProviderEntry[];
   providerModels: ProviderModelEntry[];
   providerModelTrends: ProviderModelTrendEntry[];
+  /** Dedicated heatmap stream with granularity metadata. */
+  heatmap: HeatmapPayload;
 }
 
 export type MetricKey = keyof MetricSummary;

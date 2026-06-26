@@ -9,6 +9,7 @@ import { CompositionChart } from "@/components/composition-chart";
 import { ModelChart } from "@/components/model-chart";
 import { ProviderChart } from "@/components/provider-chart";
 import { CacheHitRateChart } from "@/components/cache-hit-rate-chart";
+import { HeatmapChart, EMPTY_HEATMAP } from "@/components/heatmap-chart";
 import { Button } from "@/components/ui/button";
 import {
   Select,
@@ -161,11 +162,15 @@ export function App() {
         <div className="mt-3 grid gap-3 lg:grid-cols-12">
           <div className="relative lg:col-span-8">
             {loading && <div className="absolute inset-0 z-10 rounded-xl bg-background/50 backdrop-blur-[2px]" />}
-            <TrendChart days={data?.days || []} metric={metric} loading={loading} range={range} />
+            <HeatmapChart heatmap={data?.heatmap || EMPTY_HEATMAP} metric={metric} loading={loading} />
           </div>
           <div className="relative lg:col-span-4">
             {loading && <div className="absolute inset-0 z-10 rounded-xl bg-background/50 backdrop-blur-[2px]" />}
             <CompositionChart summary={data?.summary || ({} as any)} loading={loading} />
+          </div>
+          <div className="relative lg:col-span-12">
+            {loading && <div className="absolute inset-0 z-10 rounded-xl bg-background/50 backdrop-blur-[2px]" />}
+            <TrendChart days={data?.days || []} metric={metric} loading={loading} range={range} />
           </div>
           <div className="relative lg:col-span-7">
             {loading && <div className="absolute inset-0 z-10 rounded-xl bg-background/50 backdrop-blur-[2px]" />}

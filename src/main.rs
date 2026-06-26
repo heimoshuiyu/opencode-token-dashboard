@@ -130,6 +130,25 @@ struct Meta {
     scanned_rows: i64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Serialize)]
+#[serde(rename_all = "lowercase")]
+enum HeatmapGranularity {
+    Hourly,
+    Daily,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct HeatmapPayload {
+    /// Bucket type: "hourly" (≤ 90 days) or "daily" (> 90 days).
+    granularity: HeatmapGranularity,
+    /// Time span of one heat point in hours: 3 (hourly) or 24 (daily).
+    interval_hours: u32,
+    /// Heat-point series. Hourly entries use "YYYY-MM-DDTHH" where HH is the
+    /// 2-hour block start (00/02/…/22, 12 per day); daily entries use "YYYY-MM-DD".
+    data: Vec<DayEntry>,
+}
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct UsagePayload {
@@ -140,6 +159,10 @@ struct UsagePayload {
     providers: Vec<NamedEntry>,
     provider_models: Vec<ProviderModelEntry>,
     provider_model_trends: Vec<ProviderModelTrendEntry>,
+    /// Dedicated heatmap stream. Granularity follows range:
+    /// ≤ 90 days → hourly 2-hour blocks; > 90 days → daily.
+    /// Independent of `days` granularity so other charts are unaffected.
+    heatmap: HeatmapPayload,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -277,12 +300,31 @@ fn format_hour(ts_ms: i64) -> String {
     Local.from_utc_datetime(&dt.naive_utc()).format("%Y-%m-%dT%H").to_string()
 }
 
+/// Format timestamp as a 2-hour block start key, e.g. 13:xx → "YYYY-MM-DDT12"
+/// (12 blocks per day: 00, 02, 04, …, 22). Used by the hourly heatmap stream.
+fn format_2h_block(ts_ms: i64) -> String {
+    use chrono::TimeZone;
+    let secs = ts_ms / 1000;
+    let dt = chrono::DateTime::from_timestamp(secs, 0).unwrap_or_default();
+    let local = Local.from_utc_datetime(&dt.naive_utc());
+    let block_start = ((local.hour() as i32) / 2) * 2;
+    format!("{}T{:02}", local.format("%Y-%m-%d"), block_start)
+}
+
 /// Whether the given range value should use hourly granularity.
 fn is_hourly_range(range_value: Option<&str>) -> bool {
     match range_value {
         Some("7") => true,
         _ => false,
     }
+}
+
+/// Whether the heatmap (2-hourly) data stream should be computed.
+/// Granularity of the dedicated heatmap stream, decided purely by range:
+/// ≤ 90 days (7/30/90) → hourly buckets; > 90 days (180/365/all) → daily buckets.
+/// The heatmap is always computed; this only selects its bucket size.
+fn heatmap_is_hourly(range_value: Option<&str>) -> bool {
+    matches!(range_value, Some("7") | Some("30") | Some("90"))
 }
 
 // ── Database discovery ─────────────────────────────────────────────────────
@@ -408,11 +450,60 @@ fn fill_missing_hours(
     result
 }
 
+/// Fill missing 2-hour blocks between first_day and last_day with zero metrics.
+/// Expects bucket keys like "2026-05-30T12" where the hour is a 2-hour block
+/// start (00/02/…/22, 12 per day). Caps at the current block for today.
+fn fill_missing_2h_blocks(
+    mut totals: HashMap<String, Metrics>,
+    first_day: Option<&str>,
+    last_day: Option<&str>,
+) -> Vec<DayEntry> {
+    let (Some(first), Some(last)) = (first_day, last_day) else {
+        let mut days: Vec<DayEntry> = totals
+            .into_iter()
+            .map(|(date, metrics)| DayEntry { date, metrics })
+            .collect();
+        days.sort_by(|a, b| a.date.cmp(&b.date));
+        return days;
+    };
+
+    let start = chrono::NaiveDate::parse_from_str(first, "%Y-%m-%d");
+    let end = chrono::NaiveDate::parse_from_str(last, "%Y-%m-%d");
+    let (Ok(start), Ok(end)) = (start, end) else {
+        let mut days: Vec<DayEntry> = totals
+            .into_iter()
+            .map(|(date, metrics)| DayEntry { date, metrics })
+            .collect();
+        days.sort_by(|a, b| a.date.cmp(&b.date));
+        return days;
+    };
+
+    // Cap at the current 2-hour block so we don't emit future zero-buckets today.
+    let now = Local::now();
+    let today = now.date_naive();
+    let current_block = (now.hour() as u32) / 2; // 0..11
+
+    let mut result = Vec::new();
+    let mut current_date = start;
+    while current_date <= end {
+        let is_today = current_date == today;
+        let max_block = if is_today { current_block + 1 } else { 12 };
+        for b in 0..max_block {
+            let key = format!("{}T{:02}", current_date, b * 2);
+            let metrics = totals.remove(&key).unwrap_or_default();
+            result.push(DayEntry { date: key, metrics });
+        }
+        current_date += chrono::Duration::days(1);
+    }
+    result
+}
+
 // ── Core aggregation logic ─────────────────────────────────────────────────
 
 fn aggregate_usage(db_path: &Path, range_value: Option<&str>) -> Result<UsagePayload, String> {
     let conn = rusqlite_connection(db_path)?;
     let hourly = is_hourly_range(range_value);
+    let heatmap_hourly = heatmap_is_hourly(range_value);
 
     let mut day_totals: HashMap<String, Metrics> = HashMap::new();
     let mut model_totals: HashMap<String, Metrics> = HashMap::new();
@@ -420,9 +511,13 @@ fn aggregate_usage(db_path: &Path, range_value: Option<&str>) -> Result<UsagePay
     let mut provider_model_totals: HashMap<(String, String), Metrics> = HashMap::new();
     let mut provider_model_day_totals: HashMap<(String, String), HashMap<String, Metrics>> = HashMap::new();
     let mut user_message_days: HashMap<String, i64> = HashMap::new();
+    // Dedicated heatmap stream. Granularity follows `heatmap_hourly`
+    // (hourly for range ≤ 90, daily for range > 90). Always computed.
+    let mut heatmap_totals: HashMap<String, Metrics> = HashMap::new();
+    let mut heatmap_user_messages: HashMap<String, i64> = HashMap::new();
 
-    // (bucket, model, provider, metrics, interval)
-    let mut assistant_entries: Vec<(String, String, String, Metrics, Option<(i64, i64)>)> = Vec::new();
+    // (bucket, model, provider, metrics, interval, heatmap_bucket)
+    let mut assistant_entries: Vec<(String, String, String, Metrics, Option<(i64, i64)>, String)> = Vec::new();
 
     let mut first_day: Option<String> = None;
     let mut last_day: Option<String> = None;
@@ -486,6 +581,7 @@ fn aggregate_usage(db_path: &Path, range_value: Option<&str>) -> Result<UsagePay
         let is_child = child_session_ids.contains(&session_id);
         let metrics = extract_metrics(payload.tokens.as_ref(), time_info, is_child);
         let bucket = if hourly { format_hour(timestamp_ms) } else { format_day(timestamp_ms) };
+        let heatmap_bucket = if heatmap_hourly { format_2h_block(timestamp_ms) } else { format_day(timestamp_ms) };
         let model = payload.model_id.as_deref().unwrap_or("unknown").to_string();
         let provider = payload
             .provider_id
@@ -513,7 +609,7 @@ fn aggregate_usage(db_path: &Path, range_value: Option<&str>) -> Result<UsagePay
         first_day = Some(first_day.unwrap_or_else(|| format_day(timestamp_ms)));
         last_day = Some(format_day(timestamp_ms));
 
-        assistant_entries.push((bucket, model, provider, metrics, interval));
+        assistant_entries.push((bucket, model, provider, metrics, interval, heatmap_bucket));
     }
 
     drop(stmt);
@@ -597,6 +693,9 @@ fn aggregate_usage(db_path: &Path, range_value: Option<&str>) -> Result<UsagePay
 
         let day = if hourly { format_hour(timestamp_ms) } else { format_day(timestamp_ms) };
         *user_message_days.entry(day).or_insert(0) += 1;
+
+        let hm_bucket = if heatmap_hourly { format_2h_block(timestamp_ms) } else { format_day(timestamp_ms) };
+        *heatmap_user_messages.entry(hm_bucket).or_insert(0) += 1;
     }
 
     // Resolve day window
@@ -610,10 +709,12 @@ fn aggregate_usage(db_path: &Path, range_value: Option<&str>) -> Result<UsagePay
     let mut bucket_intervals: HashMap<String, Vec<(i64, i64)>> = HashMap::new();
     let mut model_intervals: HashMap<String, Vec<(i64, i64)>> = HashMap::new();
     let mut provider_intervals: HashMap<String, Vec<(i64, i64)>> = HashMap::new();
+    // Intervals for the dedicated heatmap stream (to compute runtime_dedup).
+    let mut heatmap_intervals: HashMap<String, Vec<(i64, i64)>> = HashMap::new();
     let mut all_intervals: Vec<(i64, i64)> = Vec::new();
     let mut assistant_rows: i64 = 0;
 
-    for (bucket, model, provider, metrics, interval) in &assistant_entries {
+    for (bucket, model, provider, metrics, interval, heatmap_bucket) in &assistant_entries {
         // For hourly: bucket is "2026-05-30T14", we need the day part for window check
         let bucket_day = if hourly {
             bucket.split_once('T').map(|(d, _)| d).unwrap_or(bucket.as_str())
@@ -630,6 +731,12 @@ fn aggregate_usage(db_path: &Path, range_value: Option<&str>) -> Result<UsagePay
                 continue;
             }
         }
+
+        // Dedicated heatmap stream (hourly for range ≤ 90, daily for range > 90).
+        heatmap_totals
+            .entry(heatmap_bucket.clone())
+            .or_default()
+            .add(metrics);
 
         day_totals
             .entry(bucket.clone())
@@ -656,6 +763,7 @@ fn aggregate_usage(db_path: &Path, range_value: Option<&str>) -> Result<UsagePay
 
         if let Some(iv) = interval {
             bucket_intervals.entry(bucket.clone()).or_default().push(*iv);
+            heatmap_intervals.entry(heatmap_bucket.clone()).or_default().push(*iv);
             model_intervals.entry(model.clone()).or_default().push(*iv);
             provider_intervals
                 .entry(provider.clone())
@@ -690,6 +798,30 @@ fn aggregate_usage(db_path: &Path, range_value: Option<&str>) -> Result<UsagePay
             .user_message_count = *count;
     }
 
+    // Inject user message counts into the dedicated heatmap stream.
+    // Keys are either "YYYY-MM-DDTHH" (hourly) or "YYYY-MM-DD" (daily);
+    // the day part is the prefix before 'T' (or the whole key when no 'T').
+    for (hm_bucket, count) in &heatmap_user_messages {
+        let hm_day = hm_bucket
+            .split_once('T')
+            .map(|(d, _)| d)
+            .unwrap_or(hm_bucket.as_str());
+        if let Some(ref sfd) = selected_first_day {
+            if hm_day < sfd.as_str() {
+                continue;
+            }
+        }
+        if let Some(ref sld) = selected_last_day {
+            if hm_day > sld.as_str() {
+                continue;
+            }
+        }
+        heatmap_totals
+            .entry(hm_bucket.clone())
+            .or_default()
+            .user_message_count = *count;
+    }
+
     // Compute dedup runtime
     for (bucket, intervals) in &mut bucket_intervals {
         let dedup = merge_intervals(intervals);
@@ -706,6 +838,10 @@ fn aggregate_usage(db_path: &Path, range_value: Option<&str>) -> Result<UsagePay
             .or_default()
             .runtime_dedup = dedup;
     }
+    for (hb, intervals) in &mut heatmap_intervals {
+        let dedup = merge_intervals(intervals);
+        heatmap_totals.entry(hb.clone()).or_default().runtime_dedup = dedup;
+    }
 
     let all_dedup = merge_intervals(&mut all_intervals);
 
@@ -714,6 +850,19 @@ fn aggregate_usage(db_path: &Path, range_value: Option<&str>) -> Result<UsagePay
         fill_missing_hours(day_totals, selected_first_day.as_deref(), selected_last_day.as_deref())
     } else {
         fill_missing_days(day_totals, selected_first_day.as_deref(), selected_last_day.as_deref())
+    };
+
+    // Dedicated heatmap stream: 2-hour blocks for range ≤ 90, daily for range > 90.
+    // Always computed (over the full selected window), no truncation.
+    let heatmap_data: Vec<DayEntry> = if heatmap_hourly {
+        fill_missing_2h_blocks(heatmap_totals, selected_first_day.as_deref(), selected_last_day.as_deref())
+    } else {
+        fill_missing_days(heatmap_totals, selected_first_day.as_deref(), selected_last_day.as_deref())
+    };
+    let heatmap = HeatmapPayload {
+        granularity: if heatmap_hourly { HeatmapGranularity::Hourly } else { HeatmapGranularity::Daily },
+        interval_hours: if heatmap_hourly { 2 } else { 24 },
+        data: heatmap_data,
     };
 
     let mut models: Vec<NamedEntry> = model_totals
@@ -798,6 +947,7 @@ fn aggregate_usage(db_path: &Path, range_value: Option<&str>) -> Result<UsagePay
         providers,
         provider_models,
         provider_model_trends,
+        heatmap,
     })
 }
 
@@ -1540,6 +1690,103 @@ mod tests {
                 "range=7 entries should use hourly format, got: {}",
                 day.date
             );
+        }
+        // Heatmap stream: hourly granularity, 2-hour blocks (≤ 7*12 = 84 points).
+        assert_eq!(payload.heatmap.granularity, HeatmapGranularity::Hourly);
+        assert_eq!(payload.heatmap.interval_hours, 2);
+        assert!(!payload.heatmap.data.is_empty(), "range=7 should produce heatmap data");
+        assert!(
+            payload.heatmap.data.len() <= 84,
+            "range=7 heatmap should have ≤ 84 two-hour points, got {}",
+            payload.heatmap.data.len()
+        );
+        for entry in &payload.heatmap.data {
+            let hour = entry.date.split_once('T').and_then(|(_, h)| h.parse::<u32>().ok());
+            assert_eq!(hour.map(|h| h % 2), Some(0u32), "heatmap block must start on a 2h boundary: {}", entry.date);
+        }
+    }
+
+    #[test]
+    fn test_aggregate_usage_range_30_daily_and_heatmap() {
+        let db_path = discover_database().expect("need opencode.db");
+        let payload = aggregate_usage(&db_path, Some("30")).expect("aggregate should succeed");
+
+        assert_eq!(payload.meta.range, "30");
+        // range=30 must stay DAILY (≤ 31 calendar-day buckets), unaffected by the heatmap stream.
+        assert!(
+            payload.days.len() <= 31,
+            "range=30 days should be daily (≤ 31 buckets), got {}",
+            payload.days.len()
+        );
+        for day in &payload.days {
+            assert!(
+                !day.date.contains('T'),
+                "range=30 days must be daily format, got: {}",
+                day.date
+            );
+        }
+        // Heatmap: hourly granularity, 2-hour blocks (≤ 30*12 = 360 points).
+        assert_eq!(payload.heatmap.granularity, HeatmapGranularity::Hourly);
+        assert_eq!(payload.heatmap.interval_hours, 2);
+        assert!(!payload.heatmap.data.is_empty(), "range=30 should produce heatmap data");
+        assert!(
+            payload.heatmap.data.len() <= 360,
+            "range=30 heatmap should have ≤ 360 two-hour points, got {}",
+            payload.heatmap.data.len()
+        );
+        for entry in &payload.heatmap.data {
+            assert!(entry.date.contains('T'), "range=30 heatmap should be 2-hour blocks");
+        }
+        // runtime_dedup must be computed for the heatmap stream (interval merge),
+        // otherwise the "runtime (deduped)" metric renders blank.
+        let dedup_sum: i64 = payload.heatmap.data.iter().map(|d| d.metrics.runtime_dedup).sum();
+        assert!(
+            dedup_sum > 0,
+            "range=30 heatmap runtime_dedup should be > 0 (got {dedup_sum})"
+        );
+    }
+
+    #[test]
+    fn test_aggregate_usage_range_90_heatmap_hourly() {
+        let db_path = discover_database().expect("need opencode.db");
+        let payload = aggregate_usage(&db_path, Some("90")).expect("aggregate should succeed");
+        assert_eq!(payload.meta.range, "90");
+        // range=90: `days` stays daily (≤ 91 buckets).
+        assert!(
+            payload.days.len() <= 91,
+            "range=90 days should be daily (≤ 91 buckets), got {}",
+            payload.days.len()
+        );
+        // range=90 (≤ 90): heatmap is hourly, 2-hour blocks (≤ 90*12 = 1080 points).
+        assert_eq!(payload.heatmap.granularity, HeatmapGranularity::Hourly);
+        assert_eq!(payload.heatmap.interval_hours, 2);
+        assert!(!payload.heatmap.data.is_empty(), "range=90 should produce heatmap data");
+        assert!(
+            payload.heatmap.data.len() <= 1080,
+            "range=90 heatmap should have ≤ 1080 two-hour points, got {}",
+            payload.heatmap.data.len()
+        );
+        for entry in &payload.heatmap.data {
+            assert!(entry.date.contains('T'), "range=90 heatmap should be 2-hour blocks");
+        }
+    }
+
+    #[test]
+    fn test_aggregate_usage_range_180_heatmap_daily() {
+        let db_path = discover_database().expect("need opencode.db");
+        let payload = aggregate_usage(&db_path, Some("180")).expect("aggregate should succeed");
+        assert_eq!(payload.meta.range, "180");
+        // range=180 (> 90): heatmap stream switches to DAILY granularity.
+        assert_eq!(payload.heatmap.granularity, HeatmapGranularity::Daily);
+        assert_eq!(payload.heatmap.interval_hours, 24);
+        assert!(!payload.heatmap.data.is_empty(), "range=180 should produce heatmap data");
+        assert!(
+            payload.heatmap.data.len() <= 181,
+            "range=180 heatmap should be daily (≤ 181 buckets), got {}",
+            payload.heatmap.data.len()
+        );
+        for entry in &payload.heatmap.data {
+            assert!(!entry.date.contains('T'), "range=180 heatmap should be daily");
         }
     }
 

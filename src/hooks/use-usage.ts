@@ -31,7 +31,13 @@ function enrichPayload(payload: UsagePayload): UsagePayload {
     ...trend,
     days: trend.days.map(injectCacheHitRate),
   }));
-  return { ...payload, summary, days, models, providers, providerModels, providerModelTrends };
+  const heatmapData = (payload.heatmap?.data || []).map(injectCacheHitRate);
+  const heatmap = {
+    granularity: payload.heatmap?.granularity ?? "daily",
+    intervalHours: payload.heatmap?.intervalHours ?? 24,
+    data: heatmapData,
+  };
+  return { ...payload, summary, days, models, providers, providerModels, providerModelTrends, heatmap };
 }
 
 export function useUsage(range: string) {

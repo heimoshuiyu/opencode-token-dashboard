@@ -60,6 +60,11 @@ export interface Translations {
     cachedTokens: string;
     clickToSolo: string;
     clickToShowAll: string;
+    heatmapTitle: string;
+    heatmapDesc: string;
+    heatmapLess: string;
+    heatmapMore: string;
+    heatmapTotal: string;
   };
   range: {
     last7: string;

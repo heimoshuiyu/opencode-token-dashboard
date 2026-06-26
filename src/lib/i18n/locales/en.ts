@@ -60,6 +60,11 @@ export const en: Translations = {
     cachedTokens: "Cached Tokens",
     clickToSolo: "Click to solo this model",
     clickToShowAll: "Click to show all",
+    heatmapTitle: "Activity Heatmap",
+    heatmapDesc: "{metric} activity — darker means more active",
+    heatmapLess: "Less",
+    heatmapMore: "More",
+    heatmapTotal: "Total",
   },
   range: {
     last7: "Last 7 days",
