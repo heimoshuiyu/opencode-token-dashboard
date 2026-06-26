@@ -131,8 +131,9 @@ function SessionList({
       </div>
 
       <ScrollArea className="h-[58vh]">
+        <div className="[&_[data-slot=table-container]]:overflow-visible">
         <Table>
-          <TableHeader className="sticky top-0 z-10 bg-background/95 backdrop-blur">
+          <TableHeader className="sticky top-0 z-10 bg-background">
             <TableRow className="border-border/50 hover:bg-transparent">
               <TableHead className="pl-5">{t("chart.columnSession")}</TableHead>
               <TableHead>{t("chart.columnModel")}</TableHead>
@@ -182,6 +183,7 @@ function SessionList({
             ))}
           </TableBody>
         </Table>
+        </div>
       </ScrollArea>
     </div>
   );
@@ -295,8 +297,9 @@ function SessionDetail({ sessionId, onBack, onSelectMessage }: { sessionId: stri
 
       {/* Per-message table */}
       <ScrollArea className="h-[34vh]">
+        <div className="[&_[data-slot=table-container]]:overflow-visible">
         <Table>
-          <TableHeader className="sticky top-0 z-10 bg-background/95 backdrop-blur">
+          <TableHeader className="sticky top-0 z-10 bg-background">
             <TableRow className="border-border/50 hover:bg-transparent">
               <TableHead className="pl-5">{t("chart.msgIndex")}</TableHead>
               <TableHead>{t("chart.columnGap")}</TableHead>
@@ -346,6 +349,7 @@ function SessionDetail({ sessionId, onBack, onSelectMessage }: { sessionId: stri
             })}
           </TableBody>
         </Table>
+        </div>
       </ScrollArea>
     </div>
   );
