@@ -1317,7 +1317,7 @@ fn aggregate_cache_miss_sessions(
             no_cache,
         });
     }
-    rows.sort_by(|a, b| b.cache_miss.cmp(&a.cache_miss));
+    rows.sort_by(|a, b| b.last_time.cmp(&a.last_time).then(b.cache_miss.cmp(&a.cache_miss)));
 
     Ok(CacheMissSessionsPayload {
         range: range_value.unwrap_or("all").to_string(),

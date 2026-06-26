@@ -219,7 +219,7 @@ export function CompositionChart({ summary, loading }: CompositionChartProps) {
   }
 
   return (
-    <Card className="glass-panel glow-border overflow-hidden rounded-xl border-0 animate-fade-in transition-colors hover:border-primary/15 stagger-4">
+    <Card className="glass-panel glow-border h-full overflow-hidden rounded-xl border-0 animate-fade-in transition-colors hover:border-primary/15 stagger-4">
       <CardHeader className="pb-1">
         <p className="mb-0.5 text-[10px] font-semibold uppercase tracking-[0.14em] text-chart-2">
           Breakdown
