@@ -152,11 +152,21 @@ total    = input + output + reasoning + cache_read + cache_write
 
 `miss` 与 `expected` 都是可加的 token 计数，按 **天 / 会话 / provider / model** 聚合。
 
+### 基准为何包含输出侧（`prev.total`）
+
+注意上面 `expected = prev.total` 用的是上一条的**完整上下文（输入 + 输出 + 推理）**，不只是输入侧。原因：
+
+- 按 API 规范，显式缓存（`cache_control`）只缓存输入前缀；但**底层 KV 缓存（含 decode / 输出阶段的 KV）在主流推理引擎里都会跨请求复用**——vLLM（Automatic Prefix Caching）、SGLang（RadixAttention，明确「保留 prompt 与 generation results 的 KV」）、DeepSeek（官方文档：在「模型输出末尾」也建缓存单元）均原生支持。
+- 因此「输出侧也该被缓存」在引擎层面是**技术上可达的标杆**，并非苛求。DeepSeek、GLM-4.7（「保留式思考」）等会复用输出 KV；glm-5.x、gpt-5.5 等则不复用——**这是 provider / 模型是否启用的差异**。
+- 用 `prev.total` 当基准：复用输出的模型 `cache_read ≈ prev.total` → miss 趋近 0（被奖励）；不复用的模型，其输出每轮被重新 prefill = **用户真在付的钱**，诚实计入 miss。
+
+一句话：这个 miss 含「输出侧未被复用」的部分，反映的是**真实重复处理的 token 浪费**，并让缓存做得好的 provider 自然凸显。
+
 ### 为什么越接近零越好
 
 理想情况下，`cur` 会从缓存读回 `prev` 的全部上下文（`cache_read ≈ prev.total`），此时 `miss ≈ 0`。`miss > 0` 意味着一部分本应命中的上下文没有走缓存、被重新处理，直接带来更高的 token 消耗与延迟。因此**未命中 token 越少越好**。
 
-> 注：聚合后的总 miss 会随使用量增长，所以「越接近零」主要体现在**单次相邻请求 / 单会话**层面。实际中未命中通常来自：会话开头几条的缓存预热（warmup）、tool 结果插入导致缓存后缀失效、或 provider 根本不支持缓存。点击专图上的数据点可下钻查看该天的会话明细与逐条缓存生命周期。
+> 注：聚合后的总 miss 会随使用量增长，所以「越接近零」主要体现在**单次相邻请求 / 单会话**层面。实际中未命中通常来自：会话开头几条的缓存预热（warmup）、tool 结果插入导致缓存后缀失效、或 provider 不支持缓存 / 不复用输出侧 KV。点击专图上的数据点可下钻查看该天的会话明细与逐条缓存生命周期。
 
 ## 统计说明
 
