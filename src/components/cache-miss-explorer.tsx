@@ -30,7 +30,7 @@ import { ArrowLeftIcon } from "lucide-react";
 import type { CacheMissSessionsPayload, CacheMissSessionDetail, CacheMissMessage, MessageContentPayload } from "@/types";
 import { useCacheMissSessions, fetchCacheMissSessionDetail, fetchCacheMissMessage } from "@/hooks/use-cache-miss";
 import { useLocale } from "@/lib/i18n";
-import { formatCompact, formatNumber, formatDateTime, formatAxisValue, formatDurationGap } from "@/lib/format";
+import { formatCompact, formatNumber, formatDateTime, formatAxisValue, formatDurationGap, formatDuration } from "@/lib/format";
 
 interface Props {
   open: boolean;
@@ -424,6 +424,51 @@ function MessageContentView({ message, onBack }: { message: CacheMissMessage; on
           </span>
         </div>
       </div>
+
+      {/* Metadata strip */}
+      {content?.metadata && (
+        <div className="flex flex-wrap items-center gap-x-3 gap-y-1 border-b px-5 py-2 font-mono text-[10px] text-muted-foreground">
+          {content.metadata.agent && (
+            <span><Badge variant="secondary" className="mr-1 px-1 py-0 text-[9px] text-foreground">{content.metadata.agent}</Badge></span>
+          )}
+          {content.metadata.mode && content.metadata.mode !== content.metadata.agent && (
+            <span>mode {content.metadata.mode}</span>
+          )}
+          {content.metadata.variant && (
+            <span>variant <span className="text-foreground">{content.metadata.variant}</span></span>
+          )}
+          {content.metadata.model && (
+            <span>model <span className="text-foreground">{content.metadata.provider}/{content.metadata.model}</span></span>
+          )}
+          {content.metadata.finish && (
+            <span>finish <span className="text-foreground">{content.metadata.finish}</span></span>
+          )}
+          {content.metadata.cost != null && content.metadata.cost > 0 && (
+            <span>cost <span className="text-foreground">${content.metadata.cost.toFixed(6)}</span></span>
+          )}
+          {content.metadata.timeCreated != null && (
+            <span>
+              time {formatDateTime(new Date(content.metadata.timeCreated).toISOString(), locale)}
+              {content.metadata.timeCompleted != null && content.metadata.timeCreated > 0
+                ? ` · ${formatDuration(content.metadata.timeCompleted - content.metadata.timeCreated)}`
+                : ""}
+            </span>
+          )}
+          {content.metadata.cwd && (
+            <span className="max-w-[280px] truncate" title={content.metadata.cwd}>cwd {content.metadata.cwd}</span>
+          )}
+          {content.metadata.extra && Object.keys(content.metadata.extra).length > 0 && (
+            <span className="text-muted-foreground/60">
+              extra {Object.entries(content.metadata.extra).map(([k, v]) => `${k}=${JSON.stringify(v).slice(0, 60)}`).join(" · ")}
+            </span>
+          )}
+        </div>
+      )}
+      {content?.metadata?.error && (
+        <div className="border-b bg-destructive/10 px-5 py-1.5 text-[11px] text-destructive">
+          ⚠ {content.metadata.error}
+        </div>
+      )}
 
       <ScrollArea className="h-[68vh]">
         <div className="flex flex-col gap-4 px-5 py-4">

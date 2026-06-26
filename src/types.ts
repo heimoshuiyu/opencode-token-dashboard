@@ -140,8 +140,24 @@ export interface MessageContentPart {
   error?: string;
 }
 
+export interface MessageMetadata {
+  agent?: string;
+  mode?: string;
+  variant?: string;
+  model?: string;
+  provider?: string;
+  finish?: string;
+  cost?: number;
+  timeCreated?: number;
+  timeCompleted?: number;
+  cwd?: string;
+  error?: string;
+  extra?: Record<string, unknown>;
+}
+
 export interface MessageContentPayload {
   messageId: string;
+  metadata: MessageMetadata;
   parts: MessageContentPart[];
 }
 

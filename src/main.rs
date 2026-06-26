@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::SystemTime;
@@ -1469,26 +1469,90 @@ struct MessageContentPart {
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
+struct MessageMetadata {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    agent: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    mode: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    variant: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    model: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    provider: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    finish: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cost: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    time_created: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    time_completed: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cwd: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
+    /// Any other top-level keys not captured above (summary, structured, future fields).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    extra: BTreeMap<String, serde_json::Value>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
 struct MessageContentPayload {
     message_id: String,
+    metadata: MessageMetadata,
     parts: Vec<MessageContentPart>,
 }
 
 /// Fetch the rendered content (parts) of a single assistant message.
 fn get_message_content(db_path: &Path, message_id: &str) -> Result<MessageContentPayload, String> {
     let conn = rusqlite_connection(db_path)?;
-    // Verify it's an assistant message in a non-excluded session.
-    let dir: String = conn
+    // Fetch the message data + verify it's an assistant message in a non-excluded session.
+    let (raw_data, dir): (String, String) = conn
         .query_row(
-            "SELECT s.directory FROM message m JOIN session s ON m.session_id = s.id \
+            "SELECT m.data, s.directory FROM message m JOIN session s ON m.session_id = s.id \
              WHERE m.id = ? AND m.data LIKE '%\"role\":\"assistant\"%'",
             rusqlite::params![message_id],
-            |row| row.get(0),
+            |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .map_err(|e| format!("消息不存在或非 assistant: {e}"))?;
     if dir.contains(".opencode") || dir.starts_with("/home/hmsy/.config/pet") {
         return Err("消息不在统计范围内".into());
     }
+
+    // Parse message metadata.
+    let msg: serde_json::Value = serde_json::from_str(&raw_data).unwrap_or(serde_json::Value::Null);
+    let s = |k: &str| msg.get(k).and_then(|v| v.as_str()).map(|v| v.to_string());
+    let time = msg.get("time");
+    let time_created = time.and_then(|t| t.get("created")).and_then(|v| v.as_i64());
+    let time_completed = time.and_then(|t| t.get("completed")).and_then(|v| v.as_i64());
+    let cwd = msg.get("path").and_then(|p| p.get("cwd")).and_then(|v| v.as_str()).map(|v| v.to_string());
+    let error = msg.get("error").and_then(|e| e.get("data")).and_then(|d| d.get("message")).and_then(|m| m.as_str()).map(|v| v.to_string());
+    // Collect "extra" keys: anything not in the known set.
+    let known = ["role", "time", "parentID", "modelID", "providerID", "mode", "agent", "path", "cost", "tokens", "finish", "variant", "error", "content"];
+    let mut extra: BTreeMap<String, serde_json::Value> = BTreeMap::new();
+    if let Some(obj) = msg.as_object() {
+        for (k, v) in obj {
+            if !known.contains(&k.as_str()) {
+                extra.insert(k.clone(), v.clone());
+            }
+        }
+    }
+    let metadata = MessageMetadata {
+        agent: s("agent"),
+        mode: s("mode"),
+        variant: s("variant"),
+        model: s("modelID"),
+        provider: s("providerID"),
+        finish: s("finish"),
+        cost: msg.get("cost").and_then(|v| v.as_f64()),
+        time_created,
+        time_completed,
+        cwd,
+        error,
+        extra,
+    };
 
     let mut stmt = conn
         .prepare("SELECT data FROM part WHERE message_id = ? ORDER BY time_created ASC, id ASC")
@@ -1543,6 +1607,7 @@ fn get_message_content(db_path: &Path, message_id: &str) -> Result<MessageConten
 
     Ok(MessageContentPayload {
         message_id: message_id.to_string(),
+        metadata,
         parts,
     })
 }
