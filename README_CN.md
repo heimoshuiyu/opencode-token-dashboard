@@ -6,7 +6,7 @@
 
 ## 截图
 
-![OpenCode Token Dashboard](https://github.com/heimoshuiyu/opencode-token-dashboard/releases/download/v1.2.0/screenshot.jpg)
+![OpenCode Token Dashboard](https://github.com/heimoshuiyu/opencode-token-dashboard/releases/download/v1.3.0/screenshot-v1.3.0.jpg)
 
 ### 缓存未命中下钻
 

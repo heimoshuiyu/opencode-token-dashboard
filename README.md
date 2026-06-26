@@ -6,7 +6,7 @@ A locally-run Token usage dashboard that reads [OpenCode's](https://github.com/a
 
 ## Screenshots
 
-![OpenCode Token Dashboard](https://github.com/heimoshuiyu/opencode-token-dashboard/releases/download/v1.2.0/screenshot.jpg)
+![OpenCode Token Dashboard](https://github.com/heimoshuiyu/opencode-token-dashboard/releases/download/v1.3.0/screenshot-v1.3.0.jpg)
 
 ### Cache Miss Drill-down
 
