@@ -591,20 +591,79 @@ fn fill_missing_2h_blocks(
 
 // ── Core aggregation logic ─────────────────────────────────────────────────
 
+/// Build an `AssistantEntry` from a parsed assistant message. Returns `None`
+/// when the row is not a usable assistant message (wrong role, or no usable
+/// timestamp). The bucket strings depend on `hourly` / `heatmap_hourly`.
+fn build_assistant_entry(
+    id: String,
+    session_id: String,
+    payload: &MessageData,
+    child_session_ids: &HashSet<String>,
+    hourly: bool,
+    heatmap_hourly: bool,
+) -> Option<AssistantEntry> {
+    if payload.role.as_deref() != Some("assistant") {
+        return None;
+    }
+    let time_info = payload.time.as_ref();
+    let timestamp_ms = time_info
+        .and_then(|t| t.completed.or(t.created))
+        .unwrap_or(0);
+    if timestamp_ms == 0 {
+        return None;
+    }
+    let is_child = child_session_ids.contains(&session_id);
+    let metrics = extract_metrics(payload.tokens.as_ref(), time_info, is_child);
+    let bucket = if hourly { format_hour(timestamp_ms) } else { format_day(timestamp_ms) };
+    let heatmap_bucket = if heatmap_hourly { format_2h_block(timestamp_ms) } else { format_day(timestamp_ms) };
+    let model = payload.model_id.as_deref().unwrap_or("unknown").to_string();
+    let provider = payload
+        .provider_id
+        .as_deref()
+        .unwrap_or("unknown")
+        .to_string();
+    let interval = if metrics.runtime > 0 {
+        if let Some(t) = time_info {
+            let created = t.created.unwrap_or(0);
+            let completed = t.completed.unwrap_or(0);
+            if created > 0 && completed > 0 {
+                Some((created, completed))
+            } else {
+                None
+            }
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+    Some(AssistantEntry {
+        id,
+        session_id,
+        ts_ms: timestamp_ms,
+        bucket,
+        heatmap_bucket,
+        model,
+        provider,
+        metrics,
+        interval,
+    })
+}
+
 /// Load all assistant messages as AssistantEntry (ordered by time_created),
 /// applying the same directory filters as the usage path. `hourly` /
 /// `heatmap_hourly` only affect the precomputed bucket strings (unused by the
 /// cache-miss endpoints, which pass false). Returns (entries, first_day,
-/// last_day, scanned_rows).
+/// last_day, scanned_rows, child_session_ids).
 fn load_assistant_entries(
     conn: &rusqlite::Connection,
     hourly: bool,
     heatmap_hourly: bool,
-) -> Result<(Vec<AssistantEntry>, Option<String>, Option<String>, i64), String> {
-    let child_session_ids: Vec<String> = conn
+) -> Result<(Vec<AssistantEntry>, Option<String>, Option<String>, i64, HashSet<String>), String> {
+    let child_session_ids: HashSet<String> = conn
         .prepare("SELECT id FROM session WHERE parent_id IS NOT NULL")
         .and_then(|mut stmt| {
-            stmt.query_map([], |row| row.get(0))
+            stmt.query_map([], |row| row.get::<_, String>(0))
                 .map(|rows| rows.filter_map(|r| r.ok()).collect())
         })
         .unwrap_or_default();
@@ -644,56 +703,122 @@ fn load_assistant_entries(
             Ok(p) => p,
             Err(_) => continue,
         };
-        if payload.role.as_deref() != Some("assistant") {
-            continue;
+        if let Some(entry) =
+            build_assistant_entry(id, session_id, &payload, &child_session_ids, hourly, heatmap_hourly)
+        {
+            first_day = Some(first_day.unwrap_or_else(|| format_day(entry.ts_ms)));
+            last_day = Some(format_day(entry.ts_ms));
+            entries.push(entry);
         }
-        let time_info = payload.time.as_ref();
-        let timestamp_ms = time_info
-            .and_then(|t| t.completed.or(t.created))
-            .unwrap_or(0);
-        if timestamp_ms == 0 {
-            continue;
-        }
-        let is_child = child_session_ids.contains(&session_id);
-        let metrics = extract_metrics(payload.tokens.as_ref(), time_info, is_child);
-        let bucket = if hourly { format_hour(timestamp_ms) } else { format_day(timestamp_ms) };
-        let heatmap_bucket = if heatmap_hourly { format_2h_block(timestamp_ms) } else { format_day(timestamp_ms) };
-        let model = payload.model_id.as_deref().unwrap_or("unknown").to_string();
-        let provider = payload
-            .provider_id
-            .as_deref()
-            .unwrap_or("unknown")
-            .to_string();
-        let interval = if metrics.runtime > 0 {
-            if let Some(t) = time_info {
-                let created = t.created.unwrap_or(0);
-                let completed = t.completed.unwrap_or(0);
-                if created > 0 && completed > 0 {
-                    Some((created, completed))
-                } else {
-                    None
-                }
-            } else {
-                None
-            }
-        } else {
-            None
-        };
-        first_day = Some(first_day.unwrap_or_else(|| format_day(timestamp_ms)));
-        last_day = Some(format_day(timestamp_ms));
-        entries.push(AssistantEntry {
-            id,
-            session_id,
-            ts_ms: timestamp_ms,
-            bucket,
-            heatmap_bucket,
-            model,
-            provider,
-            metrics,
-            interval,
-        });
     }
-    Ok((entries, first_day, last_day, scanned_rows))
+    Ok((entries, first_day, last_day, scanned_rows, child_session_ids))
+}
+
+/// Single-pass load of BOTH assistant and user messages from the `message`
+/// table. Replaces the previously-separate assistant and user scans with one
+/// table scan, so each `message.data` blob is read from disk once instead of
+/// twice. Role partitioning happens in Rust after parsing.
+///
+/// Returns `(assistant_entries, user_rows, child_session_ids, first_day,
+/// last_day, scanned_rows)` where `user_rows` holds `(id, session_id, data)`
+/// for messages whose role is `"user"` (their counting is deferred to the
+/// caller, which still needs the `part`-table validity filter). `scanned_rows`
+/// counts assistant-role rows, preserving the prior metric's meaning.
+fn load_messages(
+    conn: &rusqlite::Connection,
+    hourly: bool,
+    heatmap_hourly: bool,
+) -> Result<
+    (
+        Vec<AssistantEntry>,
+        Vec<(String, String, String)>,
+        HashSet<String>,
+        Option<String>,
+        Option<String>,
+        i64,
+    ),
+    String,
+> {
+    let child_session_ids: HashSet<String> = conn
+        .prepare("SELECT id FROM session WHERE parent_id IS NOT NULL")
+        .and_then(|mut stmt| {
+            stmt.query_map([], |row| row.get::<_, String>(0))
+                .map(|rows| rows.filter_map(|r| r.ok()).collect())
+        })
+        .unwrap_or_default();
+
+    // Broad pattern matches any message carrying a `"role":"..."` field.
+    // Both assistant and user messages match; the exact role is resolved below.
+    // No ORDER BY: it would force SQLite to sort the full result set (expensive
+    // without an index). first_day/last_day are derived correctly afterwards via
+    // min/max over the assistant entries, and pair_cache_miss re-sorts anyway.
+    let mut stmt = conn
+        .prepare(
+            "SELECT m.id, m.session_id, m.data FROM message m \
+             JOIN session s ON m.session_id = s.id \
+             WHERE m.data LIKE '%\"role\":\"%' \
+             AND s.directory NOT LIKE '%.opencode%' \
+             AND s.directory NOT LIKE '/home/hmsy/.config/pet%'",
+        )
+        .map_err(|e| format!("查询消息失败: {e}"))?;
+
+    let rows = stmt
+        .query_map([], |row| {
+            let id: String = row.get(0)?;
+            let session_id: String = row.get(1)?;
+            let data: String = row.get(2)?;
+            Ok((id, session_id, data))
+        })
+        .map_err(|e| format!("执行查询失败: {e}"))?;
+
+    let mut assistant_entries: Vec<AssistantEntry> = Vec::new();
+    let mut user_rows: Vec<(String, String, String)> = Vec::new();
+    let mut scanned_rows: i64 = 0;
+
+    for row in rows {
+        let (id, session_id, raw_data) = match row {
+            Ok(r) => r,
+            Err(_) => continue,
+        };
+        let payload: MessageData = match serde_json::from_str(&raw_data) {
+            Ok(p) => p,
+            Err(_) => continue,
+        };
+        match payload.role.as_deref() {
+            Some("assistant") => {
+                scanned_rows += 1;
+                if let Some(entry) = build_assistant_entry(
+                    id,
+                    session_id,
+                    &payload,
+                    &child_session_ids,
+                    hourly,
+                    heatmap_hourly,
+                ) {
+                    assistant_entries.push(entry);
+                }
+            }
+            Some("user") => {
+                user_rows.push((id, session_id, raw_data));
+            }
+            _ => {}
+        }
+    }
+
+    // first_day/last_day = earliest/latest day across assistant entries.
+    // Computed via min/max so the result is correct regardless of row iteration
+    // order (the merged query intentionally has no ORDER BY).
+    let first_day = assistant_entries.iter().map(|e| format_day(e.ts_ms)).min();
+    let last_day = assistant_entries.iter().map(|e| format_day(e.ts_ms)).max();
+
+    Ok((
+        assistant_entries,
+        user_rows,
+        child_session_ids,
+        first_day,
+        last_day,
+        scanned_rows,
+    ))
 }
 
 /// Load per-session compaction timestamps (epoch ms), sorted ascending.
@@ -739,22 +864,16 @@ fn aggregate_usage(db_path: &Path, range_value: Option<&str>) -> Result<UsagePay
     let mut heatmap_user_messages: HashMap<String, i64> = HashMap::new();
 
     // Collected assistant messages; pairing for cache-miss happens after loading.
-    let (mut assistant_entries, first_day, last_day, scanned_rows) =
-        load_assistant_entries(&conn, hourly, heatmap_hourly)?;
+    // Single-pass load of BOTH assistant and user messages: one scan of the
+    // message table instead of two, halving the amount of `message.data` read
+    // from disk. `child_session_ids` is reused below (no second query).
+    let (mut assistant_entries, user_rows, child_session_ids, first_day, last_day, scanned_rows) =
+        load_messages(&conn, hourly, heatmap_hourly)?;
 
     let compaction_times = load_compaction_times(&conn)?;
 
     // Pair consecutive messages within each session to compute cache miss counters.
     pair_cache_miss(&mut assistant_entries, &compaction_times);
-
-    // Child session IDs — used to exclude child sessions from user message count.
-    let child_session_ids: Vec<String> = conn
-        .prepare("SELECT id FROM session WHERE parent_id IS NOT NULL")
-        .and_then(|mut stmt| {
-            stmt.query_map([], |row| row.get(0))
-                .map(|rows| rows.filter_map(|r| r.ok()).collect())
-        })
-        .unwrap_or_default();
 
     // Get user message IDs that have at least one non-synthetic text/file part.
     // Messages whose ALL text/file parts are synthetic (or have no text/file parts at all)
@@ -780,41 +899,17 @@ fn aggregate_usage(db_path: &Path, range_value: Option<&str>) -> Result<UsagePay
         rows.filter_map(|r| r.ok()).collect()
     };
 
-    // Query user messages (excluding ignored sessions)
-    let mut stmt = conn
-        .prepare(
-            "SELECT m.id, m.session_id, m.data FROM message m \
-             JOIN session s ON m.session_id = s.id \
-             WHERE m.data LIKE '%\"role\":\"user\"%' \
-             AND s.directory NOT LIKE '%.opencode%' \
-             AND s.directory NOT LIKE '/home/hmsy/.config/pet%'",
-        )
-        .map_err(|e| format!("查询 user 消息失败: {e}"))?;
-
-    let rows = stmt
-        .query_map([], |row| {
-            let id: String = row.get(0)?;
-            let session_id: String = row.get(1)?;
-            let data: String = row.get(2)?;
-            Ok((id, session_id, data))
-        })
-        .map_err(|e| format!("执行查询失败: {e}"))?;
-
-    for row in rows {
-        let (id, session_id, raw_data) = match row {
-            Ok(r) => r,
-            Err(_) => continue,
-        };
-
-        if !valid_user_message_ids.contains(&id) {
+    // Process user messages collected by the merged scan above.
+    for (id, session_id, raw_data) in &user_rows {
+        if !valid_user_message_ids.contains(id) {
             continue;
         }
 
-        if child_session_ids.contains(&session_id) {
+        if child_session_ids.contains(session_id) {
             continue;
         }
 
-        let payload: MessageData = match serde_json::from_str(&raw_data) {
+        let payload: MessageData = match serde_json::from_str(raw_data.as_str()) {
             Ok(p) => p,
             Err(_) => continue,
         };
@@ -1124,8 +1219,20 @@ fn resolve_day_window(
 /// Open a read-only SQLite connection using rusqlite directly.
 fn rusqlite_connection(db_path: &Path) -> Result<rusqlite::Connection, String> {
     let uri = format!("file:{}?mode=ro", db_path.display());
-    rusqlite::Connection::open_with_flags(&uri, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_URI)
-        .map_err(|e| format!("打开数据库失败: {e}"))
+    let conn = rusqlite::Connection::open_with_flags(&uri, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_URI)
+        .map_err(|e| format!("打开数据库失败: {e}"))?;
+    // Runtime read-throughput PRAGMAs. These are per-connection in-memory
+    // settings: they do NOT modify the database file or its schema. Errors are
+    // ignored so opening never fails in a restricted environment.
+    //   temp_store=MEMORY : spill temp B-trees/sorts to memory, not disk
+    //   cache_size=-65536 : ~64MB page cache (negative = kibibytes)
+    //   mmap_size=268435456 : memory-map up to 256MB for faster large-table reads
+    let _ = conn.execute_batch(
+        "PRAGMA temp_store = MEMORY;\
+         PRAGMA cache_size = -65536;\
+         PRAGMA mmap_size = 268435456;",
+    );
+    Ok(conn)
 }
 
 // ── Cache-miss drill-down ──────────────────────────────────────────────────
@@ -1196,7 +1303,8 @@ fn aggregate_cache_miss_sessions(
     model_filter: Option<&str>,
 ) -> Result<CacheMissSessionsPayload, String> {
     let conn = rusqlite_connection(db_path)?;
-    let (mut entries, first_day, last_day, _scanned) = load_assistant_entries(&conn, false, false)?;
+    let (mut entries, first_day, last_day, _scanned, _child) =
+        load_assistant_entries(&conn, false, false)?;
     let compaction_times = load_compaction_times(&conn)?;
     pair_cache_miss(&mut entries, &compaction_times);
 
