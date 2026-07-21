@@ -123,6 +123,11 @@ struct ProviderModelTrendEntry {
 struct Meta {
     database: String,
     database_path: String,
+    /// When multiple databases are merged, their filenames are listed here
+    /// (most-recent-first). Empty for single-database mode for backward
+    /// compatibility with older frontends.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    databases: Vec<String>,
     generated_at: String,
     timezone: String,
     first_day: Option<String>,
@@ -461,11 +466,11 @@ fn database_activity_time(db_path: &Path) -> SystemTime {
     file_modified(db_path).max(file_modified(&sqlite_sidecar_path(db_path, "-wal")))
 }
 
-fn discover_database() -> Result<PathBuf, String> {
+fn discover_databases() -> Result<Vec<PathBuf>, String> {
     if let Ok(value) = std::env::var("OPENCODE_DB_PATH") {
         let path = PathBuf::from(value);
         if path.is_file() {
-            return Ok(path);
+            return Ok(vec![path]);
         }
         return Err(format!("OPENCODE_DB_PATH 指向的数据库不存在: {}", path.display()));
     }
@@ -482,21 +487,41 @@ fn discover_database() -> Result<PathBuf, String> {
         let path = entry.path();
         if path.is_file() && path.extension().map_or(false, |ext| ext == "db") {
             let name = path.file_name().unwrap_or_default().to_string_lossy();
-            if name.starts_with("opencode") {
+            // Skip the small side-channel DBs that don't carry message history.
+            // Include main, V2-dev, and per-user channels: anything starting
+            // with "opencode" except the credential vault `opencode-auth.db`.
+            if name.starts_with("opencode") && !name.starts_with("opencode-auth") {
                 candidates.push(path);
             }
         }
     }
 
-    candidates
-        .into_iter()
-        .max_by(|a, b| {
-            database_activity_time(a)
-                .cmp(&database_activity_time(b))
-                .then_with(|| a.file_name().cmp(&b.file_name()))
-        })
-        .ok_or_else(|| format!("没有找到 OpenCode 数据库目录: {}", data_dir.display()))
+    if candidates.is_empty() {
+        return Err(format!("没有找到 OpenCode 数据库目录: {}", data_dir.display()));
+    }
+
+    // Sort by activity time descending (most recent first). We keep all
+    // non-empty databases rather than picking one; history across channels
+    // is merged. Empty databases are skipped to avoid useless scans.
+    let mut with_activity: Vec<(PathBuf, SystemTime, i64)> = Vec::new();
+    for path in candidates {
+        let activity = database_activity_time(&path);
+        let size = std::fs::metadata(&path).map(|m| m.len() as i64).unwrap_or(0);
+        if size == 0 {
+            continue;
+        }
+        with_activity.push((path, activity, size));
+    }
+
+    if with_activity.is_empty() {
+        return Err(format!("没有找到 OpenCode 数据库目录: {}", data_dir.display()));
+    }
+
+    with_activity.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.file_name().cmp(&b.0.file_name())));
+    Ok(with_activity.into_iter().map(|(p, _, _)| p).collect())
 }
+
+
 
 // ── Fill missing time buckets ────────────────────────────────────────────
 
@@ -972,9 +997,7 @@ fn load_compaction_times(
     Ok(map)
 }
 
-fn aggregate_usage(db_path: &Path, range_value: Option<&str>) -> Result<UsagePayload, String> {
-    let conn = rusqlite_connection(db_path)?;
-    let storage = detect_message_storage(&conn)?;
+fn aggregate_usage(db_paths: &[PathBuf], range_value: Option<&str>) -> Result<UsagePayload, String> {
     let hourly = is_hourly_range(range_value);
     let heatmap_hourly = heatmap_is_hourly(range_value);
 
@@ -989,73 +1012,102 @@ fn aggregate_usage(db_path: &Path, range_value: Option<&str>) -> Result<UsagePay
     let mut heatmap_totals: HashMap<String, Metrics> = HashMap::new();
     let mut heatmap_user_messages: HashMap<String, i64> = HashMap::new();
 
-    // Collected assistant messages; pairing for cache-miss happens after loading.
-    // Single-pass load of BOTH assistant and user messages. `child_session_ids`
-    // is reused below so the session table is not queried twice.
-    let (mut assistant_entries, user_rows, child_session_ids, first_day, last_day, scanned_rows) =
-        load_messages(&conn, storage, hourly, heatmap_hourly)?;
+    // Aggregated across all databases. assistant_entries from every db are
+    // concatenated; pair_cache_miss groups by session_id internally, and
+    // session IDs are globally unique (verified for opencode V1↔V2 channels),
+    // so no cross-database pairing collision occurs.
+    let mut assistant_entries: Vec<AssistantEntry> = Vec::new();
+    let mut first_day: Option<String> = None;
+    let mut last_day: Option<String> = None;
+    let mut scanned_rows: i64 = 0;
+    let mut seen_message_ids: HashSet<String> = HashSet::new();
 
-    let compaction_times = load_compaction_times(&conn, storage)?;
+    for db_path in db_paths {
+        let conn = rusqlite_connection(db_path)?;
+        let storage = detect_message_storage(&conn)?;
 
-    // Pair consecutive messages within each session to compute cache miss counters.
-    pair_cache_miss(&mut assistant_entries, &compaction_times);
+        let (mut entries, user_rows, child_session_ids, db_first_day, db_last_day, db_scanned) =
+            load_messages(&conn, storage, hourly, heatmap_hourly)?;
 
-    // V1 needs the part-table validity filter. V2 has a distinct `synthetic`
-    // message type, so every row loaded as `user` is a real user message.
-    let valid_user_message_ids: HashSet<String> = match storage {
-        MessageStorage::V2 => user_rows.iter().map(|(id, _, _)| id.clone()).collect(),
-        MessageStorage::V1 => {
-            let mut stmt = conn
-                .prepare(
-                    "SELECT DISTINCT p.message_id FROM part p \
-                     JOIN message m ON p.message_id = m.id \
-                     JOIN session s ON m.session_id = s.id \
-                     WHERE m.data LIKE '%\"role\":\"user\"%' \
-                     AND s.directory NOT LIKE '%.opencode%' \
-                     AND s.directory NOT LIKE '/home/hmsy/.config/pet%' \
-                     AND json_extract(p.data, '$.type') IN ('text', 'file') \
-                     AND (json_extract(p.data, '$.synthetic') IS NULL OR json_extract(p.data, '$.synthetic') != 1)",
-                )
-                .map_err(|e| format!("查询有效用户消息失败: {e}"))?;
+        let compaction_times = load_compaction_times(&conn, storage)?;
+        pair_cache_miss(&mut entries, &compaction_times);
 
-            let rows = stmt
-                .query_map([], |row| row.get::<_, String>(0))
-                .map_err(|e| format!("执行查询失败: {e}"))?;
-
-            rows.filter_map(|r| r.ok()).collect()
+        // Merge day bounds across databases (track the global span so the
+        // range window resolves against the combined history).
+        if let Some(fd) = db_first_day {
+            first_day = Some(first_day.map_or(fd.clone(), |existing| existing.min(fd)));
         }
-    };
-
-    // Process user messages collected by the merged scan above.
-    for (id, session_id, raw_data) in &user_rows {
-        if !valid_user_message_ids.contains(id) {
-            continue;
+        if let Some(ld) = db_last_day {
+            last_day = Some(last_day.map_or(ld.clone(), |existing| existing.max(ld)));
         }
+        scanned_rows += db_scanned;
 
-        if child_session_ids.contains(session_id) {
-            continue;
-        }
+        // V1 needs the part-table validity filter. V2 has a distinct `synthetic`
+        // message type, so every row loaded as `user` is a real user message.
+        let valid_user_message_ids: HashSet<String> = match storage {
+            MessageStorage::V2 => user_rows.iter().map(|(id, _, _)| id.clone()).collect(),
+            MessageStorage::V1 => {
+                let mut stmt = conn
+                    .prepare(
+                        "SELECT DISTINCT p.message_id FROM part p \
+                         JOIN message m ON p.message_id = m.id \
+                         JOIN session s ON m.session_id = s.id \
+                         WHERE m.data LIKE '%\"role\":\"user\"%' \
+                         AND s.directory NOT LIKE '%.opencode%' \
+                         AND s.directory NOT LIKE '/home/hmsy/.config/pet%' \
+                         AND json_extract(p.data, '$.type') IN ('text', 'file') \
+                         AND (json_extract(p.data, '$.synthetic') IS NULL OR json_extract(p.data, '$.synthetic') != 1)",
+                    )
+                    .map_err(|e| format!("查询有效用户消息失败: {e}"))?;
 
-        let payload: MessageData = match serde_json::from_str(raw_data.as_str()) {
-            Ok(p) => p,
-            Err(_) => continue,
+                let rows = stmt
+                    .query_map([], |row| row.get::<_, String>(0))
+                    .map_err(|e| format!("执行查询失败: {e}"))?;
+
+                rows.filter_map(|r| r.ok()).collect()
+            }
         };
 
-        let timestamp_ms = payload
-            .time
-            .as_ref()
-            .and_then(|t| t.completed.or(t.created))
-            .unwrap_or(0);
+        // Process user messages collected by the merged scan above.
+        for (id, session_id, raw_data) in &user_rows {
+            if !valid_user_message_ids.contains(id) {
+                continue;
+            }
 
-        if timestamp_ms == 0 {
-            continue;
+            if child_session_ids.contains(session_id) {
+                continue;
+            }
+
+            let payload: MessageData = match serde_json::from_str(raw_data.as_str()) {
+                Ok(p) => p,
+                Err(_) => continue,
+            };
+
+            let timestamp_ms = payload
+                .time
+                .as_ref()
+                .and_then(|t| t.completed.or(t.created))
+                .unwrap_or(0);
+
+            if timestamp_ms == 0 {
+                continue;
+            }
+
+            let day = if hourly { format_hour(timestamp_ms) } else { format_day(timestamp_ms) };
+            *user_message_days.entry(day).or_insert(0) += 1;
+
+            let hm_bucket = if heatmap_hourly { format_2h_block(timestamp_ms) } else { format_day(timestamp_ms) };
+            *heatmap_user_messages.entry(hm_bucket).or_insert(0) += 1;
         }
 
-        let day = if hourly { format_hour(timestamp_ms) } else { format_day(timestamp_ms) };
-        *user_message_days.entry(day).or_insert(0) += 1;
-
-        let hm_bucket = if heatmap_hourly { format_2h_block(timestamp_ms) } else { format_day(timestamp_ms) };
-        *heatmap_user_messages.entry(hm_bucket).or_insert(0) += 1;
+        // Merge this database's assistant entries into the global stream.
+        // Dedup by message id guards against the rare case where the same
+        // message id appears in two databases (e.g. an export/import cycle).
+        for entry in entries {
+            if seen_message_ids.insert(entry.id.clone()) {
+                assistant_entries.push(entry);
+            }
+        }
     }
 
     // Resolve day window
@@ -1286,12 +1338,23 @@ fn aggregate_usage(db_path: &Path, range_value: Option<&str>) -> Result<UsagePay
 
     Ok(UsagePayload {
         meta: Meta {
-            database: db_path
-                .file_name()
-                .unwrap_or_default()
-                .to_string_lossy()
-                .to_string(),
-            database_path: db_path.display().to_string(),
+            database: db_paths
+                .first()
+                .and_then(|p| p.file_name())
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_default(),
+            database_path: db_paths
+                .first()
+                .map(|p| p.display().to_string())
+                .unwrap_or_default(),
+            databases: if db_paths.len() > 1 {
+                db_paths
+                    .iter()
+                    .filter_map(|p| p.file_name().map(|n| n.to_string_lossy().to_string()))
+                    .collect()
+            } else {
+                Vec::new()
+            },
             generated_at: Local::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, false),
             timezone: Local::now().format("%Z").to_string(),
             first_day: selected_first_day,
@@ -1419,29 +1482,39 @@ struct CacheMissSessionDetail {
 
 /// Per-session cache-miss aggregation for the selected range.
 fn aggregate_cache_miss_sessions(
-    db_path: &Path,
+    db_paths: &[PathBuf],
     range_value: Option<&str>,
     date_filter: Option<&str>,
     provider_filter: Option<&str>,
     model_filter: Option<&str>,
 ) -> Result<CacheMissSessionsPayload, String> {
-    let conn = rusqlite_connection(db_path)?;
-    let storage = detect_message_storage(&conn)?;
-    let (mut entries, first_day, last_day, _scanned, _child) =
-        load_assistant_entries(&conn, storage, false, false)?;
-    let compaction_times = load_compaction_times(&conn, storage)?;
-    pair_cache_miss(&mut entries, &compaction_times);
-
-    // The range window is only used when no exact date filter is given.
-    let (sel_first, sel_last) = if date_filter.is_some() {
-        (None, None)
-    } else {
-        resolve_day_window(first_day.as_deref(), last_day.as_deref(), range_value)
-    };
-
-    // session titles
+    let mut entries: Vec<AssistantEntry> = Vec::new();
+    let mut first_day: Option<String> = None;
+    let mut last_day: Option<String> = None;
     let mut titles: HashMap<String, String> = HashMap::new();
-    {
+    let mut seen_message_ids: HashSet<String> = HashSet::new();
+
+    for db_path in db_paths {
+        let conn = rusqlite_connection(db_path)?;
+        let storage = detect_message_storage(&conn)?;
+        let (mut db_entries, db_first_day, db_last_day, _scanned, _child) =
+            load_assistant_entries(&conn, storage, false, false)?;
+        let compaction_times = load_compaction_times(&conn, storage)?;
+        pair_cache_miss(&mut db_entries, &compaction_times);
+
+        for e in db_entries {
+            if seen_message_ids.insert(e.id.clone()) {
+                entries.push(e);
+            }
+        }
+        if let Some(fd) = db_first_day {
+            first_day = Some(first_day.map_or(fd.clone(), |existing| existing.min(fd)));
+        }
+        if let Some(ld) = db_last_day {
+            last_day = Some(last_day.map_or(ld.clone(), |existing| existing.max(ld)));
+        }
+
+        // session titles (merge across databases; later dbs override on conflict)
         let mut stmt = conn
             .prepare("SELECT id, title FROM session")
             .map_err(|e| format!("查询 session 失败: {e}"))?;
@@ -1454,6 +1527,13 @@ fn aggregate_cache_miss_sessions(
             }
         }
     }
+
+    // The range window is only used when no exact date filter is given.
+    let (sel_first, sel_last) = if date_filter.is_some() {
+        (None, None)
+    } else {
+        resolve_day_window(first_day.as_deref(), last_day.as_deref(), range_value)
+    };
 
     struct SessAgg {
         miss: i64,
@@ -1561,18 +1641,52 @@ fn aggregate_cache_miss_sessions(
 
 /// Per-message cache-miss lifecycle for a single session.
 fn aggregate_cache_miss_session_detail(
-    db_path: &Path,
+    db_paths: &[PathBuf],
     session_id: &str,
 ) -> Result<CacheMissSessionDetail, String> {
-    let conn = rusqlite_connection(db_path)?;
-    let storage = detect_message_storage(&conn)?;
-    let (title, dir): (String, String) = conn
-        .query_row(
+    // Sessions live in exactly one database. Find the one that has this session.
+    let mut conn: Option<rusqlite::Connection> = None;
+    let mut storage_opt: Option<MessageStorage> = None;
+    let mut session_row: Option<(String, String)> = None;
+    let mut last_err: Option<String> = None;
+    for db_path in db_paths {
+        let attempt = rusqlite_connection(db_path);
+        let c = match attempt {
+            Ok(c) => c,
+            Err(e) => {
+                last_err = Some(e);
+                continue;
+            }
+        };
+        let storage = match detect_message_storage(&c) {
+            Ok(s) => s,
+            Err(e) => {
+                last_err = Some(e);
+                continue;
+            }
+        };
+        let row: Result<(String, String), rusqlite::Error> = c.query_row(
             "SELECT title, directory FROM session WHERE id = ?",
             rusqlite::params![session_id],
             |row| Ok((row.get(0)?, row.get(1)?)),
-        )
-        .map_err(|e| format!("会话不存在: {e}"))?;
+        );
+        match row {
+            Ok(r) => {
+                conn = Some(c);
+                storage_opt = Some(storage);
+                session_row = Some(r);
+                break;
+            }
+            Err(rusqlite::Error::QueryReturnedNoRows) => continue,
+            Err(e) => {
+                last_err = Some(format!("查询 session 失败: {e}"));
+                continue;
+            }
+        }
+    }
+    let conn = conn.ok_or_else(|| last_err.unwrap_or_else(|| "会话不存在".to_string()))?;
+    let storage = storage_opt.unwrap();
+    let (title, dir) = session_row.unwrap();
     if dir.contains(".opencode") || dir.starts_with("/home/hmsy/.config/pet") {
         return Err("会话不在统计范围内".into());
     }
@@ -1768,28 +1882,59 @@ fn render_tool_content(value: &serde_json::Value) -> Option<String> {
 }
 
 /// Fetch the rendered content (parts) of a single assistant message.
-fn get_message_content(db_path: &Path, message_id: &str) -> Result<MessageContentPayload, String> {
-    let conn = rusqlite_connection(db_path)?;
-    let storage = detect_message_storage(&conn)?;
-    // Fetch the message data + verify it's an assistant message in a non-excluded session.
-    let query = match storage {
-        MessageStorage::V1 => {
-            "SELECT m.data, s.directory FROM message m JOIN session s ON m.session_id = s.id \
-             WHERE m.id = ? AND m.data LIKE '%\"role\":\"assistant\"%'"
+fn get_message_content(db_paths: &[PathBuf], message_id: &str) -> Result<MessageContentPayload, String> {
+    // Messages live in exactly one database. Scan each until we find a match.
+    let mut conn: Option<rusqlite::Connection> = None;
+    let mut storage_opt: Option<MessageStorage> = None;
+    let mut raw_data_opt: Option<String> = None;
+    let mut session_dir: String = String::new();
+    let mut last_err: Option<String> = None;
+    for db_path in db_paths {
+        let c = match rusqlite_connection(db_path) {
+            Ok(c) => c,
+            Err(e) => {
+                last_err = Some(e);
+                continue;
+            }
+        };
+        let storage = match detect_message_storage(&c) {
+            Ok(s) => s,
+            Err(e) => {
+                last_err = Some(e);
+                continue;
+            }
+        };
+        let query = match storage {
+            MessageStorage::V1 => {
+                "SELECT m.data, s.directory FROM message m JOIN session s ON m.session_id = s.id \
+                 WHERE m.id = ? AND m.data LIKE '%\"role\":\"assistant\"%'"
+            }
+            MessageStorage::V2 => {
+                "SELECT m.data, s.directory FROM session_message m JOIN session s ON m.session_id = s.id \
+                 WHERE m.id = ? AND m.type = 'assistant'"
+            }
+        };
+        match c.query_row(query, rusqlite::params![message_id], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        }) {
+            Ok((data, dir)) => {
+                conn = Some(c);
+                storage_opt = Some(storage);
+                raw_data_opt = Some(data);
+                session_dir = dir;
+                break;
+            }
+            Err(rusqlite::Error::QueryReturnedNoRows) => continue,
+            Err(e) => {
+                last_err = Some(format!("查询失败: {e}"));
+                continue;
+            }
         }
-        MessageStorage::V2 => {
-            "SELECT m.data, s.directory FROM session_message m JOIN session s ON m.session_id = s.id \
-             WHERE m.id = ? AND m.type = 'assistant'"
-        }
-    };
-    let (raw_data, dir): (String, String) = conn
-        .query_row(
-            query,
-            rusqlite::params![message_id],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        )
-        .map_err(|e| format!("消息不存在或非 assistant: {e}"))?;
-    if dir.contains(".opencode") || dir.starts_with("/home/hmsy/.config/pet") {
+    }
+    let conn = conn.ok_or_else(|| last_err.unwrap_or_else(|| format!("消息不存在或非 assistant: {message_id}")))?;
+    let storage = storage_opt.unwrap();
+    let raw_data = raw_data_opt.unwrap();
+    if session_dir.contains(".opencode") || session_dir.starts_with("/home/hmsy/.config/pet") {
         return Err("消息不在统计范围内".into());
     }
 
@@ -1808,7 +1953,7 @@ fn get_message_content(db_path: &Path, message_id: &str) -> Result<MessageConten
     let variant = msg.get("variant").and_then(|v| v.as_str())
         .or_else(|| msg.get("model").and_then(|m| m.get("variant")).and_then(|v| v.as_str()))
         .map(|v| v.to_string());
-    let cwd = msg.get("path").and_then(|p| p.get("cwd")).and_then(|v| v.as_str()).map(|v| v.to_string()).or_else(|| Some(dir.clone()));
+    let cwd = msg.get("path").and_then(|p| p.get("cwd")).and_then(|v| v.as_str()).map(|v| v.to_string()).or_else(|| Some(session_dir.clone()));
     let error = msg.get("error").and_then(|e| e.get("message")).and_then(|m| m.as_str())
         .or_else(|| msg.get("error").and_then(|e| e.get("data")).and_then(|d| d.get("message")).and_then(|m| m.as_str()))
         .map(|v| v.to_string());
@@ -1902,7 +2047,7 @@ fn get_message_content(db_path: &Path, message_id: &str) -> Result<MessageConten
 
 async fn get_usage_payload(
     state: &AppState,
-    db_path: &Path,
+    db_paths: &[PathBuf],
     range_value: Option<&str>,
 ) -> Result<UsagePayload, String> {
     fn file_signature(path: &Path) -> String {
@@ -1920,8 +2065,18 @@ async fn get_usage_payload(
         }
     }
 
-    let database_signature = file_signature(db_path);
-    let wal_signature = file_signature(&sqlite_sidecar_path(db_path, "-wal"));
+    // Build a single combined signature across every database + its WAL.
+    // The key uses the joined path list so different db sets don't collide.
+    let paths_key = db_paths
+        .iter()
+        .map(|p| p.display().to_string())
+        .collect::<Vec<_>>()
+        .join("|");
+    let mut sig_parts: Vec<String> = Vec::with_capacity(db_paths.len() * 2 + 2);
+    for p in db_paths {
+        sig_parts.push(file_signature(p));
+        sig_parts.push(file_signature(&sqlite_sidecar_path(p, "-wal")));
+    }
 
     // Include current date in cache signature so the cache auto-invalidates at midnight.
     // This ensures date-dependent logic (e.g. fill_missing_hours, generated_at)
@@ -1929,8 +2084,8 @@ async fn get_usage_payload(
     // Date is only added to signature (not key) so the old entry is replaced in-place
     // rather than accumulating stale entries across days.
     let today = Local::now().format("%Y-%m-%d").to_string();
-    let cache_key = format!("{}::{}", db_path.display(), range_value.unwrap_or("all"));
-    let signature = format!("{}:{}:{database_signature}:{wal_signature}:{today}", db_path.display(), range_value.unwrap_or("all"));
+    let cache_key = format!("{}::{}", paths_key, range_value.unwrap_or("all"));
+    let signature = format!("{}::{}::{}", paths_key, sig_parts.join("::"), today);
 
     {
         let cache = state.cache.read().await;
@@ -1941,7 +2096,7 @@ async fn get_usage_payload(
         }
     }
 
-    let payload = aggregate_usage(db_path, range_value)?;
+    let payload = aggregate_usage(db_paths, range_value)?;
 
     {
         let mut cache = state.cache.write().await;
@@ -1969,7 +2124,7 @@ async fn api_usage(
 ) -> impl IntoResponse {
     let range_value = params.range.as_deref();
 
-    let db_path = match discover_database() {
+    let db_paths = match discover_databases() {
         Ok(p) => p,
         Err(e) => {
             return (
@@ -1980,7 +2135,7 @@ async fn api_usage(
         }
     };
 
-    match get_usage_payload(&state, &db_path, range_value).await {
+    match get_usage_payload(&state, &db_paths, range_value).await {
         Ok(payload) => Json(payload).into_response(),
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -1994,7 +2149,7 @@ async fn api_cache_miss_sessions(
     Query(params): Query<CacheMissQuery>,
 ) -> impl IntoResponse {
     let range_value = params.range.as_deref();
-    let db_path = match discover_database() {
+    let db_paths = match discover_databases() {
         Ok(p) => p,
         Err(e) => {
             return (
@@ -2005,7 +2160,7 @@ async fn api_cache_miss_sessions(
         }
     };
     match aggregate_cache_miss_sessions(
-        &db_path,
+        &db_paths,
         range_value,
         params.date.as_deref(),
         params.provider.as_deref(),
@@ -2023,7 +2178,7 @@ async fn api_cache_miss_sessions(
 async fn api_cache_miss_session_detail(
     axum::extract::Path(session_id): axum::extract::Path<String>,
 ) -> impl IntoResponse {
-    let db_path = match discover_database() {
+    let db_paths = match discover_databases() {
         Ok(p) => p,
         Err(e) => {
             return (
@@ -2033,7 +2188,7 @@ async fn api_cache_miss_session_detail(
                 .into_response();
         }
     };
-    match aggregate_cache_miss_session_detail(&db_path, &session_id) {
+    match aggregate_cache_miss_session_detail(&db_paths, &session_id) {
         Ok(payload) => Json(payload).into_response(),
         Err(e) => (
             StatusCode::NOT_FOUND,
@@ -2046,7 +2201,7 @@ async fn api_cache_miss_session_detail(
 async fn api_cache_miss_message(
     axum::extract::Path(message_id): axum::extract::Path<String>,
 ) -> impl IntoResponse {
-    let db_path = match discover_database() {
+    let db_paths = match discover_databases() {
         Ok(p) => p,
         Err(e) => {
             return (
@@ -2056,7 +2211,7 @@ async fn api_cache_miss_message(
                 .into_response();
         }
     };
-    match get_message_content(&db_path, &message_id) {
+    match get_message_content(&db_paths, &message_id) {
         Ok(payload) => Json(payload).into_response(),
         Err(e) => (
             StatusCode::NOT_FOUND,
@@ -2702,7 +2857,7 @@ mod tests {
         }
         drop(conn);
 
-        let usage = aggregate_usage(&db_path, None).unwrap();
+        let usage = aggregate_usage(&[db_path.clone()], None).unwrap();
         assert_eq!(usage.summary.total, 385);
         assert_eq!(usage.summary.user_message_count, 1);
         assert_eq!(usage.summary.cache_miss, 5);
@@ -2710,16 +2865,16 @@ mod tests {
         assert_eq!(usage.models[0].name, "model-a");
         assert_eq!(usage.providers[0].name, "provider-a");
 
-        let sessions = aggregate_cache_miss_sessions(&db_path, None, None, None, None).unwrap();
+        let sessions = aggregate_cache_miss_sessions(&[db_path.clone()], None, None, None, None).unwrap();
         assert_eq!(sessions.sessions.len(), 1);
         assert_eq!(sessions.sessions[0].cache_miss, 5);
         assert_eq!(sessions.sessions[0].cache_expected, 175);
 
-        let detail = aggregate_cache_miss_session_detail(&db_path, "ses_test").unwrap();
+        let detail = aggregate_cache_miss_session_detail(&[db_path.clone()], "ses_test").unwrap();
         assert_eq!(detail.messages.len(), 2);
         assert_eq!(detail.messages[1].miss, Some(5));
 
-        let content = get_message_content(&db_path, "msg_assistant_2").unwrap();
+        let content = get_message_content(&[db_path.clone()], "msg_assistant_2").unwrap();
         assert_eq!(content.metadata.model.as_deref(), Some("model-a"));
         assert_eq!(content.parts.len(), 2);
         assert_eq!(content.parts[1].name.as_deref(), Some("shell"));
@@ -2761,6 +2916,7 @@ mod tests {
         let m = Meta {
             database: "opencode.db".into(),
             database_path: "/path/to/opencode.db".into(),
+            databases: Vec::new(),
             generated_at: "2026-05-30T14:00:00+08:00".into(),
             timezone: "+08:00".into(),
             first_day: Some("2026-05-01".into()),
@@ -2813,8 +2969,8 @@ mod tests {
 
     #[test]
     fn test_aggregate_usage_all() {
-        let db_path = discover_database().expect("need opencode.db for integration test");
-        let payload = aggregate_usage(&db_path, None).expect("aggregate should succeed");
+        let db_path = discover_databases().expect("need opencode.db for integration test").into_iter().next().unwrap();
+        let payload = aggregate_usage(&[db_path.clone()], None).expect("aggregate should succeed");
 
         // Basic structural assertions
         assert!(payload.summary.total > 0, "total tokens should be > 0");
@@ -2845,8 +3001,8 @@ mod tests {
 
     #[test]
     fn test_aggregate_usage_range_7() {
-        let db_path = discover_database().expect("need opencode.db");
-        let payload = aggregate_usage(&db_path, Some("7")).expect("aggregate should succeed");
+        let db_path = discover_databases().expect("need opencode.db").into_iter().next().unwrap();
+        let payload = aggregate_usage(&[db_path.clone()], Some("7")).expect("aggregate should succeed");
 
         assert_eq!(payload.meta.range, "7");
         // range=7 now uses hourly granularity: up to 7*24 = 168 hourly buckets
@@ -2880,8 +3036,8 @@ mod tests {
 
     #[test]
     fn test_aggregate_usage_range_30_daily_and_heatmap() {
-        let db_path = discover_database().expect("need opencode.db");
-        let payload = aggregate_usage(&db_path, Some("30")).expect("aggregate should succeed");
+        let db_path = discover_databases().expect("need opencode.db").into_iter().next().unwrap();
+        let payload = aggregate_usage(&[db_path.clone()], Some("30")).expect("aggregate should succeed");
 
         assert_eq!(payload.meta.range, "30");
         // range=30 must stay DAILY (≤ 31 calendar-day buckets), unaffected by the heatmap stream.
@@ -2920,8 +3076,8 @@ mod tests {
 
     #[test]
     fn test_aggregate_usage_range_90_heatmap_hourly() {
-        let db_path = discover_database().expect("need opencode.db");
-        let payload = aggregate_usage(&db_path, Some("90")).expect("aggregate should succeed");
+        let db_path = discover_databases().expect("need opencode.db").into_iter().next().unwrap();
+        let payload = aggregate_usage(&[db_path.clone()], Some("90")).expect("aggregate should succeed");
         assert_eq!(payload.meta.range, "90");
         // range=90: `days` stays daily (≤ 91 buckets).
         assert!(
@@ -2945,8 +3101,8 @@ mod tests {
 
     #[test]
     fn test_aggregate_usage_range_180_heatmap_daily() {
-        let db_path = discover_database().expect("need opencode.db");
-        let payload = aggregate_usage(&db_path, Some("180")).expect("aggregate should succeed");
+        let db_path = discover_databases().expect("need opencode.db").into_iter().next().unwrap();
+        let payload = aggregate_usage(&[db_path.clone()], Some("180")).expect("aggregate should succeed");
         assert_eq!(payload.meta.range, "180");
         // range=180 (> 90): heatmap stream switches to DAILY granularity.
         assert_eq!(payload.heatmap.granularity, HeatmapGranularity::Daily);
@@ -2965,8 +3121,8 @@ mod tests {
     #[test]
     fn test_aggregate_usage_consistency() {
         // Summary should equal sum of all days
-        let db_path = discover_database().expect("need opencode.db");
-        let payload = aggregate_usage(&db_path, Some("30")).expect("aggregate should succeed");
+        let db_path = discover_databases().expect("need opencode.db").into_iter().next().unwrap();
+        let payload = aggregate_usage(&[db_path.clone()], Some("30")).expect("aggregate should succeed");
 
         let mut total_from_days: i64 = 0;
         let mut input_from_days: i64 = 0;

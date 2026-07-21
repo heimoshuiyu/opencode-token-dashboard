@@ -139,7 +139,7 @@ Windows 版本启动后会自动打开浏览器。数据目录为 `%USERPROFILE%
 HOST=0.0.0.0 PORT=9000 ./target/release/opencode-token-dashboard
 ```
 
-OpenCode V2 的开发 channel 可能使用 `opencode-local.db` 等文件名。看板会自动选择最近活跃的 `opencode*.db`，并将 WAL 更新纳入判断。如需固定读取某个 channel，可显式指定：
+OpenCode V2 的开发 channel 可能使用 `opencode-local.db` 等文件名。看板会自动发现数据目录下的**所有** `opencode*.db`，并合并它们的历史 —— 各 channel 的 session id 互不重叠，因此累计不会重复计数。最近最活跃的数据库排在最前。如需限制只读取某个 channel，可显式指定：
 
 ```bash
 OPENCODE_DB_PATH="$HOME/.local/share/opencode/opencode-local.db" ./target/release/opencode-token-dashboard

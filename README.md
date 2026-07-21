@@ -127,7 +127,7 @@ The Windows build automatically opens a browser on launch. The data directory is
 HOST=0.0.0.0 PORT=9000 ./target/release/opencode-token-dashboard
 ```
 
-OpenCode V2 development channels may use names such as `opencode-local.db`. The dashboard automatically selects the most recently active `opencode*.db` file, including WAL activity. Set `OPENCODE_DB_PATH` when you want to pin a specific channel database:
+OpenCode V2 development channels may use names such as `opencode-local.db`. The dashboard automatically discovers **all** `opencode*.db` files in the data directory and merges their history — different channels' session IDs are non-overlapping, so totals are summed without double-counting. The most recently active database is listed first. Set `OPENCODE_DB_PATH` when you want to restrict the dashboard to a single channel:
 
 ```bash
 OPENCODE_DB_PATH="$HOME/.local/share/opencode/opencode-local.db" ./target/release/opencode-token-dashboard

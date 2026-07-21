@@ -33,3 +33,7 @@ screenshot*.jpg
 # Env
 .env
 .env.local
+
+# OpenCode local agent artifacts
+.agents/
+skills-lock.json
