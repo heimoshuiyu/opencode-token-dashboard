@@ -205,13 +205,34 @@ struct AppState {
 
 #[derive(Deserialize)]
 struct MessageData {
-    role: Option<String>,
     #[serde(rename = "modelID")]
     model_id: Option<String>,
     #[serde(rename = "providerID")]
     provider_id: Option<String>,
+    model: Option<ModelData>,
     tokens: Option<TokenData>,
     time: Option<TimeData>,
+}
+
+#[derive(Deserialize)]
+struct ModelData {
+    id: Option<String>,
+    #[serde(rename = "providerID")]
+    provider_id: Option<String>,
+}
+
+impl MessageData {
+    fn model_id(&self) -> Option<&str> {
+        self.model_id
+            .as_deref()
+            .or_else(|| self.model.as_ref().and_then(|model| model.id.as_deref()))
+    }
+
+    fn provider_id(&self) -> Option<&str> {
+        self.provider_id
+            .as_deref()
+            .or_else(|| self.model.as_ref().and_then(|model| model.provider_id.as_deref()))
+    }
 }
 
 #[derive(Deserialize)]
@@ -233,6 +254,12 @@ struct CacheData {
 struct TimeData {
     created: Option<i64>,
     completed: Option<i64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MessageStorage {
+    V1,
+    V2,
 }
 
 fn extract_metrics(tokens: Option<&TokenData>, time: Option<&TimeData>, skip_runtime: bool) -> Metrics {
@@ -420,14 +447,35 @@ fn heatmap_is_hourly(range_value: Option<&str>) -> bool {
 
 // ── Database discovery ─────────────────────────────────────────────────────
 
+fn sqlite_sidecar_path(db_path: &Path, suffix: &str) -> PathBuf {
+    PathBuf::from(format!("{}{}", db_path.display(), suffix))
+}
+
+fn file_modified(path: &Path) -> SystemTime {
+    std::fs::metadata(path)
+        .and_then(|metadata| metadata.modified())
+        .unwrap_or(SystemTime::UNIX_EPOCH)
+}
+
+fn database_activity_time(db_path: &Path) -> SystemTime {
+    file_modified(db_path).max(file_modified(&sqlite_sidecar_path(db_path, "-wal")))
+}
+
 fn discover_database() -> Result<PathBuf, String> {
+    if let Ok(value) = std::env::var("OPENCODE_DB_PATH") {
+        let path = PathBuf::from(value);
+        if path.is_file() {
+            return Ok(path);
+        }
+        return Err(format!("OPENCODE_DB_PATH 指向的数据库不存在: {}", path.display()));
+    }
+
     let data_dir = opencode_data_dir();
     if !data_dir.exists() {
         return Err(format!("没有找到 OpenCode 数据库目录: {}", data_dir.display()));
     }
 
-    let mut preferred: Vec<PathBuf> = Vec::new();
-    let mut others: Vec<PathBuf> = Vec::new();
+    let mut candidates: Vec<PathBuf> = Vec::new();
 
     for entry in std::fs::read_dir(&data_dir).map_err(|e| e.to_string())? {
         let entry = entry.map_err(|e| e.to_string())?;
@@ -435,23 +483,18 @@ fn discover_database() -> Result<PathBuf, String> {
         if path.is_file() && path.extension().map_or(false, |ext| ext == "db") {
             let name = path.file_name().unwrap_or_default().to_string_lossy();
             if name.starts_with("opencode") {
-                if name == "opencode.db" {
-                    preferred.push(path);
-                } else {
-                    others.push(path);
-                }
+                candidates.push(path);
             }
         }
     }
 
-    if !preferred.is_empty() {
-        preferred.sort();
-        return Ok(preferred.into_iter().next().unwrap());
-    }
-    others.sort();
-    others
+    candidates
         .into_iter()
-        .next()
+        .max_by(|a, b| {
+            database_activity_time(a)
+                .cmp(&database_activity_time(b))
+                .then_with(|| a.file_name().cmp(&b.file_name()))
+        })
         .ok_or_else(|| format!("没有找到 OpenCode 数据库目录: {}", data_dir.display()))
 }
 
@@ -591,18 +634,47 @@ fn fill_missing_2h_blocks(
 
 // ── Core aggregation logic ─────────────────────────────────────────────────
 
+fn table_exists(conn: &rusqlite::Connection, table: &str) -> Result<bool, String> {
+    conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?)",
+        rusqlite::params![table],
+        |row| row.get::<_, bool>(0),
+    )
+    .map_err(|e| format!("检查数据库表失败: {e}"))
+}
+
+fn detect_message_storage(conn: &rusqlite::Connection) -> Result<MessageStorage, String> {
+    if table_exists(conn, "session_message")? {
+        let has_v2_messages = conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM session_message LIMIT 1)",
+                [],
+                |row| row.get::<_, bool>(0),
+            )
+            .map_err(|e| format!("检查 v2 消息表失败: {e}"))?;
+        if has_v2_messages || !table_exists(conn, "message")? {
+            return Ok(MessageStorage::V2);
+        }
+    }
+    if table_exists(conn, "message")? {
+        return Ok(MessageStorage::V1);
+    }
+    Err("OpenCode 数据库中没有找到 message 或 session_message 表".into())
+}
+
 /// Build an `AssistantEntry` from a parsed assistant message. Returns `None`
 /// when the row is not a usable assistant message (wrong role, or no usable
 /// timestamp). The bucket strings depend on `hourly` / `heatmap_hourly`.
 fn build_assistant_entry(
     id: String,
     session_id: String,
+    message_type: &str,
     payload: &MessageData,
     child_session_ids: &HashSet<String>,
     hourly: bool,
     heatmap_hourly: bool,
 ) -> Option<AssistantEntry> {
-    if payload.role.as_deref() != Some("assistant") {
+    if message_type != "assistant" {
         return None;
     }
     let time_info = payload.time.as_ref();
@@ -616,10 +688,9 @@ fn build_assistant_entry(
     let metrics = extract_metrics(payload.tokens.as_ref(), time_info, is_child);
     let bucket = if hourly { format_hour(timestamp_ms) } else { format_day(timestamp_ms) };
     let heatmap_bucket = if heatmap_hourly { format_2h_block(timestamp_ms) } else { format_day(timestamp_ms) };
-    let model = payload.model_id.as_deref().unwrap_or("unknown").to_string();
+    let model = payload.model_id().unwrap_or("unknown").to_string();
     let provider = payload
-        .provider_id
-        .as_deref()
+        .provider_id()
         .unwrap_or("unknown")
         .to_string();
     let interval = if metrics.runtime > 0 {
@@ -657,6 +728,7 @@ fn build_assistant_entry(
 /// last_day, scanned_rows, child_session_ids).
 fn load_assistant_entries(
     conn: &rusqlite::Connection,
+    storage: MessageStorage,
     hourly: bool,
     heatmap_hourly: bool,
 ) -> Result<(Vec<AssistantEntry>, Option<String>, Option<String>, i64, HashSet<String>), String> {
@@ -668,23 +740,35 @@ fn load_assistant_entries(
         })
         .unwrap_or_default();
 
-    let mut stmt = conn
-        .prepare(
-            "SELECT m.id, m.session_id, m.data FROM message m \
+    let query = match storage {
+        MessageStorage::V1 => {
+            "SELECT m.id, m.session_id, json_extract(m.data, '$.role'), m.data FROM message m \
              JOIN session s ON m.session_id = s.id \
              WHERE m.data LIKE '%\"role\":\"assistant\"%' \
              AND s.directory NOT LIKE '%.opencode%' \
              AND s.directory NOT LIKE '/home/hmsy/.config/pet%' \
-             ORDER BY m.time_created ASC",
-        )
+             ORDER BY m.time_created ASC"
+        }
+        MessageStorage::V2 => {
+            "SELECT m.id, m.session_id, m.type, m.data FROM session_message m \
+             JOIN session s ON m.session_id = s.id \
+             WHERE m.type = 'assistant' \
+             AND s.directory NOT LIKE '%.opencode%' \
+             AND s.directory NOT LIKE '/home/hmsy/.config/pet%' \
+             ORDER BY m.time_created ASC"
+        }
+    };
+    let mut stmt = conn
+        .prepare(query)
         .map_err(|e| format!("查询 assistant 消息失败: {e}"))?;
 
     let rows = stmt
         .query_map([], |row| {
             let id: String = row.get(0)?;
             let session_id: String = row.get(1)?;
-            let data: String = row.get(2)?;
-            Ok((id, session_id, data))
+            let message_type: String = row.get(2)?;
+            let data: String = row.get(3)?;
+            Ok((id, session_id, message_type, data))
         })
         .map_err(|e| format!("执行查询失败: {e}"))?;
 
@@ -694,7 +778,7 @@ fn load_assistant_entries(
     let mut scanned_rows: i64 = 0;
 
     for row in rows {
-        let (id, session_id, raw_data) = match row {
+        let (id, session_id, message_type, raw_data) = match row {
             Ok(r) => r,
             Err(_) => continue,
         };
@@ -703,9 +787,15 @@ fn load_assistant_entries(
             Ok(p) => p,
             Err(_) => continue,
         };
-        if let Some(entry) =
-            build_assistant_entry(id, session_id, &payload, &child_session_ids, hourly, heatmap_hourly)
-        {
+        if let Some(entry) = build_assistant_entry(
+            id,
+            session_id,
+            &message_type,
+            &payload,
+            &child_session_ids,
+            hourly,
+            heatmap_hourly,
+        ) {
             first_day = Some(first_day.unwrap_or_else(|| format_day(entry.ts_ms)));
             last_day = Some(format_day(entry.ts_ms));
             entries.push(entry);
@@ -714,18 +804,17 @@ fn load_assistant_entries(
     Ok((entries, first_day, last_day, scanned_rows, child_session_ids))
 }
 
-/// Single-pass load of BOTH assistant and user messages from the `message`
-/// table. Replaces the previously-separate assistant and user scans with one
-/// table scan, so each `message.data` blob is read from disk once instead of
-/// twice. Role partitioning happens in Rust after parsing.
+/// Single-pass load of BOTH assistant and user messages from the active message
+/// table (`message` on V1, `session_message` on V2).
 ///
 /// Returns `(assistant_entries, user_rows, child_session_ids, first_day,
 /// last_day, scanned_rows)` where `user_rows` holds `(id, session_id, data)`
-/// for messages whose role is `"user"` (their counting is deferred to the
-/// caller, which still needs the `part`-table validity filter). `scanned_rows`
-/// counts assistant-role rows, preserving the prior metric's meaning.
+/// for user messages. V1 counting still applies the `part`-table validity
+/// filter; V2 already separates synthetic messages by type. `scanned_rows`
+/// counts assistant rows, preserving the prior metric's meaning.
 fn load_messages(
     conn: &rusqlite::Connection,
+    storage: MessageStorage,
     hourly: bool,
     heatmap_hourly: bool,
 ) -> Result<
@@ -747,27 +836,35 @@ fn load_messages(
         })
         .unwrap_or_default();
 
-    // Broad pattern matches any message carrying a `"role":"..."` field.
-    // Both assistant and user messages match; the exact role is resolved below.
-    // No ORDER BY: it would force SQLite to sort the full result set (expensive
-    // without an index). first_day/last_day are derived correctly afterwards via
-    // min/max over the assistant entries, and pair_cache_miss re-sorts anyway.
-    let mut stmt = conn
-        .prepare(
-            "SELECT m.id, m.session_id, m.data FROM message m \
+    // No ORDER BY: it would force SQLite to sort the full result set. The date
+    // bounds are derived via min/max and cache-miss pairing sorts afterwards.
+    let query = match storage {
+        MessageStorage::V1 => {
+            "SELECT m.id, m.session_id, json_extract(m.data, '$.role'), m.data FROM message m \
              JOIN session s ON m.session_id = s.id \
              WHERE m.data LIKE '%\"role\":\"%' \
              AND s.directory NOT LIKE '%.opencode%' \
-             AND s.directory NOT LIKE '/home/hmsy/.config/pet%'",
-        )
+             AND s.directory NOT LIKE '/home/hmsy/.config/pet%'"
+        }
+        MessageStorage::V2 => {
+            "SELECT m.id, m.session_id, m.type, m.data FROM session_message m \
+             JOIN session s ON m.session_id = s.id \
+             WHERE m.type IN ('assistant', 'user') \
+             AND s.directory NOT LIKE '%.opencode%' \
+             AND s.directory NOT LIKE '/home/hmsy/.config/pet%'"
+        }
+    };
+    let mut stmt = conn
+        .prepare(query)
         .map_err(|e| format!("查询消息失败: {e}"))?;
 
     let rows = stmt
         .query_map([], |row| {
             let id: String = row.get(0)?;
             let session_id: String = row.get(1)?;
-            let data: String = row.get(2)?;
-            Ok((id, session_id, data))
+            let message_type: String = row.get(2)?;
+            let data: String = row.get(3)?;
+            Ok((id, session_id, message_type, data))
         })
         .map_err(|e| format!("执行查询失败: {e}"))?;
 
@@ -776,7 +873,7 @@ fn load_messages(
     let mut scanned_rows: i64 = 0;
 
     for row in rows {
-        let (id, session_id, raw_data) = match row {
+        let (id, session_id, message_type, raw_data) = match row {
             Ok(r) => r,
             Err(_) => continue,
         };
@@ -784,12 +881,13 @@ fn load_messages(
             Ok(p) => p,
             Err(_) => continue,
         };
-        match payload.role.as_deref() {
-            Some("assistant") => {
+        match message_type.as_str() {
+            "assistant" => {
                 scanned_rows += 1;
                 if let Some(entry) = build_assistant_entry(
                     id,
                     session_id,
+                    &message_type,
                     &payload,
                     &child_session_ids,
                     hourly,
@@ -798,7 +896,7 @@ fn load_messages(
                     assistant_entries.push(entry);
                 }
             }
-            Some("user") => {
+            "user" => {
                 user_rows.push((id, session_id, raw_data));
             }
             _ => {}
@@ -822,16 +920,30 @@ fn load_messages(
 }
 
 /// Load per-session compaction timestamps (epoch ms), sorted ascending.
-fn load_compaction_times(conn: &rusqlite::Connection) -> Result<HashMap<String, Vec<i64>>, String> {
+fn load_compaction_times(
+    conn: &rusqlite::Connection,
+    storage: MessageStorage,
+) -> Result<HashMap<String, Vec<i64>>, String> {
     let mut map: HashMap<String, Vec<i64>> = HashMap::new();
-    let mut stmt = conn
-        .prepare(
+    let query = match storage {
+        MessageStorage::V1 => {
             "SELECT p.session_id, p.time_created FROM part p \
              JOIN session s ON p.session_id = s.id \
              WHERE json_extract(p.data, '$.type') = 'compaction' \
              AND s.directory NOT LIKE '%.opencode%' \
-             AND s.directory NOT LIKE '/home/hmsy/.config/pet%'",
-        )
+             AND s.directory NOT LIKE '/home/hmsy/.config/pet%'"
+        }
+        MessageStorage::V2 => {
+            "SELECT m.session_id, m.time_created FROM session_message m \
+             JOIN session s ON m.session_id = s.id \
+             WHERE m.type = 'compaction' \
+             AND json_extract(m.data, '$.status') = 'completed' \
+             AND s.directory NOT LIKE '%.opencode%' \
+             AND s.directory NOT LIKE '/home/hmsy/.config/pet%'"
+        }
+    };
+    let mut stmt = conn
+        .prepare(query)
         .map_err(|e| format!("查询 compaction 消息失败: {e}"))?;
     let rows = stmt
         .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)))
@@ -849,6 +961,7 @@ fn load_compaction_times(conn: &rusqlite::Connection) -> Result<HashMap<String, 
 
 fn aggregate_usage(db_path: &Path, range_value: Option<&str>) -> Result<UsagePayload, String> {
     let conn = rusqlite_connection(db_path)?;
+    let storage = detect_message_storage(&conn)?;
     let hourly = is_hourly_range(range_value);
     let heatmap_hourly = heatmap_is_hourly(range_value);
 
@@ -864,39 +977,40 @@ fn aggregate_usage(db_path: &Path, range_value: Option<&str>) -> Result<UsagePay
     let mut heatmap_user_messages: HashMap<String, i64> = HashMap::new();
 
     // Collected assistant messages; pairing for cache-miss happens after loading.
-    // Single-pass load of BOTH assistant and user messages: one scan of the
-    // message table instead of two, halving the amount of `message.data` read
-    // from disk. `child_session_ids` is reused below (no second query).
+    // Single-pass load of BOTH assistant and user messages. `child_session_ids`
+    // is reused below so the session table is not queried twice.
     let (mut assistant_entries, user_rows, child_session_ids, first_day, last_day, scanned_rows) =
-        load_messages(&conn, hourly, heatmap_hourly)?;
+        load_messages(&conn, storage, hourly, heatmap_hourly)?;
 
-    let compaction_times = load_compaction_times(&conn)?;
+    let compaction_times = load_compaction_times(&conn, storage)?;
 
     // Pair consecutive messages within each session to compute cache miss counters.
     pair_cache_miss(&mut assistant_entries, &compaction_times);
 
-    // Get user message IDs that have at least one non-synthetic text/file part.
-    // Messages whose ALL text/file parts are synthetic (or have no text/file parts at all)
-    // are considered program-generated and should be excluded from user message count.
-    let valid_user_message_ids: HashSet<String> = {
-        let mut stmt = conn
-            .prepare(
-                "SELECT DISTINCT p.message_id FROM part p \
-                 JOIN message m ON p.message_id = m.id \
-                 JOIN session s ON m.session_id = s.id \
-                 WHERE m.data LIKE '%\"role\":\"user\"%' \
-                 AND s.directory NOT LIKE '%.opencode%' \
-                 AND s.directory NOT LIKE '/home/hmsy/.config/pet%' \
-                 AND json_extract(p.data, '$.type') IN ('text', 'file') \
-                 AND (json_extract(p.data, '$.synthetic') IS NULL OR json_extract(p.data, '$.synthetic') != 1)",
-            )
-            .map_err(|e| format!("查询有效用户消息失败: {e}"))?;
+    // V1 needs the part-table validity filter. V2 has a distinct `synthetic`
+    // message type, so every row loaded as `user` is a real user message.
+    let valid_user_message_ids: HashSet<String> = match storage {
+        MessageStorage::V2 => user_rows.iter().map(|(id, _, _)| id.clone()).collect(),
+        MessageStorage::V1 => {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT DISTINCT p.message_id FROM part p \
+                     JOIN message m ON p.message_id = m.id \
+                     JOIN session s ON m.session_id = s.id \
+                     WHERE m.data LIKE '%\"role\":\"user\"%' \
+                     AND s.directory NOT LIKE '%.opencode%' \
+                     AND s.directory NOT LIKE '/home/hmsy/.config/pet%' \
+                     AND json_extract(p.data, '$.type') IN ('text', 'file') \
+                     AND (json_extract(p.data, '$.synthetic') IS NULL OR json_extract(p.data, '$.synthetic') != 1)",
+                )
+                .map_err(|e| format!("查询有效用户消息失败: {e}"))?;
 
-        let rows = stmt
-            .query_map([], |row| row.get::<_, String>(0))
-            .map_err(|e| format!("执行查询失败: {e}"))?;
+            let rows = stmt
+                .query_map([], |row| row.get::<_, String>(0))
+                .map_err(|e| format!("执行查询失败: {e}"))?;
 
-        rows.filter_map(|r| r.ok()).collect()
+            rows.filter_map(|r| r.ok()).collect()
+        }
     };
 
     // Process user messages collected by the merged scan above.
@@ -913,10 +1027,6 @@ fn aggregate_usage(db_path: &Path, range_value: Option<&str>) -> Result<UsagePay
             Ok(p) => p,
             Err(_) => continue,
         };
-
-        if payload.role.as_deref() != Some("user") {
-            continue;
-        }
 
         let timestamp_ms = payload
             .time
@@ -1303,9 +1413,10 @@ fn aggregate_cache_miss_sessions(
     model_filter: Option<&str>,
 ) -> Result<CacheMissSessionsPayload, String> {
     let conn = rusqlite_connection(db_path)?;
+    let storage = detect_message_storage(&conn)?;
     let (mut entries, first_day, last_day, _scanned, _child) =
-        load_assistant_entries(&conn, false, false)?;
-    let compaction_times = load_compaction_times(&conn)?;
+        load_assistant_entries(&conn, storage, false, false)?;
+    let compaction_times = load_compaction_times(&conn, storage)?;
     pair_cache_miss(&mut entries, &compaction_times);
 
     // The range window is only used when no exact date filter is given.
@@ -1441,6 +1552,7 @@ fn aggregate_cache_miss_session_detail(
     session_id: &str,
 ) -> Result<CacheMissSessionDetail, String> {
     let conn = rusqlite_connection(db_path)?;
+    let storage = detect_message_storage(&conn)?;
     let (title, dir): (String, String) = conn
         .query_row(
             "SELECT title, directory FROM session WHERE id = ?",
@@ -1453,24 +1565,35 @@ fn aggregate_cache_miss_session_detail(
     }
 
     // Load only this session's assistant messages (focused query — cheap).
-    let mut stmt = conn
-        .prepare(
-            "SELECT m.id, m.data FROM message m \
+    let query = match storage {
+        MessageStorage::V1 => {
+            "SELECT m.id, json_extract(m.data, '$.role'), m.data FROM message m \
              JOIN session s ON m.session_id = s.id \
              WHERE m.session_id = ? AND m.data LIKE '%\"role\":\"assistant\"%' \
              AND s.directory NOT LIKE '%.opencode%' \
              AND s.directory NOT LIKE '/home/hmsy/.config/pet%' \
-             ORDER BY m.time_created ASC",
-        )
+             ORDER BY m.time_created ASC"
+        }
+        MessageStorage::V2 => {
+            "SELECT m.id, m.type, m.data FROM session_message m \
+             JOIN session s ON m.session_id = s.id \
+             WHERE m.session_id = ? AND m.type = 'assistant' \
+             AND s.directory NOT LIKE '%.opencode%' \
+             AND s.directory NOT LIKE '/home/hmsy/.config/pet%' \
+             ORDER BY m.time_created ASC"
+        }
+    };
+    let mut stmt = conn
+        .prepare(query)
         .map_err(|e| format!("查询失败: {e}"))?;
     let mut entries: Vec<AssistantEntry> = Vec::new();
     let rows = stmt
         .query_map(rusqlite::params![session_id], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?))
         })
         .map_err(|e| format!("执行查询失败: {e}"))?;
     for row in rows {
-        let (id, raw) = match row {
+        let (id, message_type, raw) = match row {
             Ok(r) => r,
             Err(_) => continue,
         };
@@ -1478,7 +1601,7 @@ fn aggregate_cache_miss_session_detail(
             Ok(p) => p,
             Err(_) => continue,
         };
-        if payload.role.as_deref() != Some("assistant") {
+        if message_type != "assistant" {
             continue;
         }
         let time_info = payload.time.as_ref();
@@ -1487,8 +1610,8 @@ fn aggregate_cache_miss_session_detail(
             continue;
         }
         let metrics = extract_metrics(payload.tokens.as_ref(), time_info, false);
-        let model = payload.model_id.as_deref().unwrap_or("unknown").to_string();
-        let provider = payload.provider_id.as_deref().unwrap_or("unknown").to_string();
+        let model = payload.model_id().unwrap_or("unknown").to_string();
+        let provider = payload.provider_id().unwrap_or("unknown").to_string();
         entries.push(AssistantEntry {
             id,
             session_id: session_id.to_string(),
@@ -1501,7 +1624,7 @@ fn aggregate_cache_miss_session_detail(
             interval: None,
         });
     }
-    let compaction_times = load_compaction_times(&conn)?;
+    let compaction_times = load_compaction_times(&conn, storage)?;
     pair_cache_miss(&mut entries, &compaction_times);
 
     // Emit non-zero messages in time order (pair_cache_miss already sorted).
@@ -1613,14 +1736,42 @@ struct MessageContentPayload {
     parts: Vec<MessageContentPart>,
 }
 
+fn display_json_value(value: &serde_json::Value) -> String {
+    value.as_str().map(|value| value.to_string()).unwrap_or_else(|| value.to_string())
+}
+
+fn render_tool_content(value: &serde_json::Value) -> Option<String> {
+    let values = value.as_array()?;
+    let rendered: Vec<String> = values
+        .iter()
+        .map(|item| {
+            item.get("text")
+                .and_then(|text| text.as_str())
+                .map(|text| text.to_string())
+                .unwrap_or_else(|| item.to_string())
+        })
+        .collect();
+    if rendered.is_empty() { None } else { Some(rendered.join("\n")) }
+}
+
 /// Fetch the rendered content (parts) of a single assistant message.
 fn get_message_content(db_path: &Path, message_id: &str) -> Result<MessageContentPayload, String> {
     let conn = rusqlite_connection(db_path)?;
+    let storage = detect_message_storage(&conn)?;
     // Fetch the message data + verify it's an assistant message in a non-excluded session.
+    let query = match storage {
+        MessageStorage::V1 => {
+            "SELECT m.data, s.directory FROM message m JOIN session s ON m.session_id = s.id \
+             WHERE m.id = ? AND m.data LIKE '%\"role\":\"assistant\"%'"
+        }
+        MessageStorage::V2 => {
+            "SELECT m.data, s.directory FROM session_message m JOIN session s ON m.session_id = s.id \
+             WHERE m.id = ? AND m.type = 'assistant'"
+        }
+    };
     let (raw_data, dir): (String, String) = conn
         .query_row(
-            "SELECT m.data, s.directory FROM message m JOIN session s ON m.session_id = s.id \
-             WHERE m.id = ? AND m.data LIKE '%\"role\":\"assistant\"%'",
+            query,
             rusqlite::params![message_id],
             |row| Ok((row.get(0)?, row.get(1)?)),
         )
@@ -1635,10 +1786,21 @@ fn get_message_content(db_path: &Path, message_id: &str) -> Result<MessageConten
     let time = msg.get("time");
     let time_created = time.and_then(|t| t.get("created")).and_then(|v| v.as_i64());
     let time_completed = time.and_then(|t| t.get("completed")).and_then(|v| v.as_i64());
-    let cwd = msg.get("path").and_then(|p| p.get("cwd")).and_then(|v| v.as_str()).map(|v| v.to_string());
-    let error = msg.get("error").and_then(|e| e.get("data")).and_then(|d| d.get("message")).and_then(|m| m.as_str()).map(|v| v.to_string());
+    let model = msg.get("modelID").and_then(|v| v.as_str())
+        .or_else(|| msg.get("model").and_then(|m| m.get("id")).and_then(|v| v.as_str()))
+        .map(|v| v.to_string());
+    let provider = msg.get("providerID").and_then(|v| v.as_str())
+        .or_else(|| msg.get("model").and_then(|m| m.get("providerID")).and_then(|v| v.as_str()))
+        .map(|v| v.to_string());
+    let variant = msg.get("variant").and_then(|v| v.as_str())
+        .or_else(|| msg.get("model").and_then(|m| m.get("variant")).and_then(|v| v.as_str()))
+        .map(|v| v.to_string());
+    let cwd = msg.get("path").and_then(|p| p.get("cwd")).and_then(|v| v.as_str()).map(|v| v.to_string()).or_else(|| Some(dir.clone()));
+    let error = msg.get("error").and_then(|e| e.get("message")).and_then(|m| m.as_str())
+        .or_else(|| msg.get("error").and_then(|e| e.get("data")).and_then(|d| d.get("message")).and_then(|m| m.as_str()))
+        .map(|v| v.to_string());
     // Collect "extra" keys: anything not in the known set.
-    let known = ["role", "time", "parentID", "modelID", "providerID", "mode", "agent", "path", "cost", "tokens", "finish", "variant", "error", "content"];
+    let known = ["role", "time", "parentID", "modelID", "providerID", "model", "mode", "agent", "path", "cost", "tokens", "finish", "variant", "error", "content"];
     let mut extra: BTreeMap<String, serde_json::Value> = BTreeMap::new();
     if let Some(obj) = msg.as_object() {
         for (k, v) in obj {
@@ -1650,9 +1812,9 @@ fn get_message_content(db_path: &Path, message_id: &str) -> Result<MessageConten
     let metadata = MessageMetadata {
         agent: s("agent"),
         mode: s("mode"),
-        variant: s("variant"),
-        model: s("modelID"),
-        provider: s("providerID"),
+        variant,
+        model,
+        provider,
         finish: s("finish"),
         cost: msg.get("cost").and_then(|v| v.as_f64()),
         time_created,
@@ -1662,23 +1824,23 @@ fn get_message_content(db_path: &Path, message_id: &str) -> Result<MessageConten
         extra,
     };
 
-    let mut stmt = conn
-        .prepare("SELECT data FROM part WHERE message_id = ? ORDER BY time_created ASC, id ASC")
-        .map_err(|e| format!("查询 part 失败: {e}"))?;
-    let rows = stmt
-        .query_map(rusqlite::params![message_id], |row| row.get::<_, String>(0))
-        .map_err(|e| format!("执行查询失败: {e}"))?;
+    let part_values: Vec<serde_json::Value> = match storage {
+        MessageStorage::V1 => {
+            let mut stmt = conn
+                .prepare("SELECT data FROM part WHERE message_id = ? ORDER BY time_created ASC, id ASC")
+                .map_err(|e| format!("查询 part 失败: {e}"))?;
+            let rows = stmt
+                .query_map(rusqlite::params![message_id], |row| row.get::<_, String>(0))
+                .map_err(|e| format!("执行查询失败: {e}"))?;
+            rows.filter_map(|row| row.ok())
+                .filter_map(|raw| serde_json::from_str(&raw).ok())
+                .collect()
+        }
+        MessageStorage::V2 => msg.get("content").and_then(|content| content.as_array()).cloned().unwrap_or_default(),
+    };
 
     let mut parts: Vec<MessageContentPart> = Vec::new();
-    for raw in rows {
-        let raw = match raw {
-            Ok(r) => r,
-            Err(_) => continue,
-        };
-        let v: serde_json::Value = match serde_json::from_str(&raw) {
-            Ok(v) => v,
-            Err(_) => continue,
-        };
+    for v in part_values {
         let part_type = v.get("type").and_then(|t| t.as_str()).unwrap_or("").to_string();
         match part_type.as_str() {
             "text" | "reasoning" => {
@@ -1686,26 +1848,29 @@ fn get_message_content(db_path: &Path, message_id: &str) -> Result<MessageConten
                 parts.push(MessageContentPart { part_type, text, name: None, status: None, title: None, input: None, output: None, error: None });
             }
             "tool" => {
-                let name = v.get("tool").and_then(|t| t.as_str()).map(|s| s.to_string());
+                let name = v.get("tool").or_else(|| v.get("name")).and_then(|t| t.as_str()).map(|s| s.to_string());
                 let state = v.get("state");
                 let status = state.and_then(|s| s.get("status")).and_then(|s| s.as_str()).map(|s| s.to_string());
-                let title = state.and_then(|s| s.get("title")).and_then(|s| s.as_str()).map(|s| s.to_string());
-                let input = state.and_then(|s| s.get("input")).map(|i| i.to_string());
+                let title = state.and_then(|s| s.get("title")).and_then(|s| s.as_str())
+                    .or_else(|| state.and_then(|s| s.get("structured")).and_then(|s| s.get("title")).and_then(|s| s.as_str()))
+                    .map(|s| s.to_string());
+                let input = state.and_then(|s| s.get("input")).map(display_json_value);
                 let output = state
                     .and_then(|s| s.get("output"))
-                    .and_then(|s| s.as_str())
-                    .map(|s| s.to_string())
+                    .map(display_json_value)
                     .or_else(|| {
                         state
                             .and_then(|s| s.get("metadata"))
                             .and_then(|m| m.get("output"))
-                            .and_then(|o| o.as_str())
-                            .map(|s| s.to_string())
-                    });
+                            .map(display_json_value)
+                    })
+                    .or_else(|| state.and_then(|s| s.get("content")).and_then(render_tool_content))
+                    .or_else(|| state.and_then(|s| s.get("result")).map(display_json_value));
                 let error = state
                     .and_then(|s| s.get("error"))
                     .and_then(|e| e.get("message"))
                     .and_then(|m| m.as_str())
+                    .or_else(|| state.and_then(|s| s.get("error")).and_then(|e| e.get("data")).and_then(|d| d.get("message")).and_then(|m| m.as_str()))
                     .map(|s| s.to_string());
                 parts.push(MessageContentPart { part_type, text: None, name, status, title, input, output, error });
             }
@@ -1727,14 +1892,23 @@ async fn get_usage_payload(
     db_path: &Path,
     range_value: Option<&str>,
 ) -> Result<UsagePayload, String> {
-    let stat = std::fs::metadata(db_path).map_err(|e| format!("读取数据库元数据失败: {e}"))?;
-    let mtime = stat
-        .modified()
-        .unwrap_or(SystemTime::UNIX_EPOCH)
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos();
-    let size = stat.len();
+    fn file_signature(path: &Path) -> String {
+        match std::fs::metadata(path) {
+            Ok(metadata) => {
+                let mtime = metadata
+                    .modified()
+                    .unwrap_or(SystemTime::UNIX_EPOCH)
+                    .duration_since(SystemTime::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_nanos();
+                format!("{mtime}:{}", metadata.len())
+            }
+            Err(_) => "missing".into(),
+        }
+    }
+
+    let database_signature = file_signature(db_path);
+    let wal_signature = file_signature(&sqlite_sidecar_path(db_path, "-wal"));
 
     // Include current date in cache signature so the cache auto-invalidates at midnight.
     // This ensures date-dependent logic (e.g. fill_missing_hours, generated_at)
@@ -1743,7 +1917,7 @@ async fn get_usage_payload(
     // rather than accumulating stale entries across days.
     let today = Local::now().format("%Y-%m-%d").to_string();
     let cache_key = format!("{}::{}", db_path.display(), range_value.unwrap_or("all"));
-    let signature = format!("{}:{}:{mtime}:{size}:{today}", db_path.display(), range_value.unwrap_or("all"));
+    let signature = format!("{}:{}:{database_signature}:{wal_signature}:{today}", db_path.display(), range_value.unwrap_or("all"));
 
     {
         let cache = state.cache.read().await;
@@ -2209,6 +2383,8 @@ mod tests {
             reasoning: 0,
             cache_read: 50,
             cache_write: 0,
+            cache_miss: 0,
+            cache_expected: 0,
             runtime: 1000,
             runtime_dedup: 800,
             user_message_count: 5,
@@ -2221,6 +2397,8 @@ mod tests {
             reasoning: 0,
             cache_read: 100,
             cache_write: 0,
+            cache_miss: 0,
+            cache_expected: 0,
             runtime: 2000,
             runtime_dedup: 1500,
             user_message_count: 10,
@@ -2246,6 +2424,8 @@ mod tests {
         assert_eq!(m.reasoning, 0);
         assert_eq!(m.cache_read, 0);
         assert_eq!(m.cache_write, 0);
+        assert_eq!(m.cache_miss, 0);
+        assert_eq!(m.cache_expected, 0);
         assert_eq!(m.runtime, 0);
         assert_eq!(m.runtime_dedup, 0);
         assert_eq!(m.user_message_count, 0);
@@ -2354,7 +2534,6 @@ mod tests {
             "time": { "created": 1771425275634, "completed": 1771425283771 }
         }"#;
         let msg: MessageData = serde_json::from_str(raw).unwrap();
-        assert_eq!(msg.role.as_deref(), Some("assistant"));
         assert_eq!(msg.model_id.as_deref(), Some("glm-5"));
         assert_eq!(msg.provider_id.as_deref(), Some("zhipuai-coding-plan"));
 
@@ -2365,13 +2544,140 @@ mod tests {
     }
 
     #[test]
+    fn test_message_data_deserialize_v2() {
+        let raw = r#"{
+            "model": {
+                "id": "gpt-5.6-sol",
+                "providerID": "openai"
+            },
+            "tokens": {
+                "input": 100,
+                "output": 20,
+                "reasoning": 10,
+                "cache": { "read": 500, "write": 0 }
+            },
+            "time": { "created": 1784602475605, "completed": 1784602475613 }
+        }"#;
+        let msg: MessageData = serde_json::from_str(raw).unwrap();
+        assert_eq!(msg.model_id(), Some("gpt-5.6-sol"));
+        assert_eq!(msg.provider_id(), Some("openai"));
+        assert_eq!(msg.tokens.as_ref().unwrap().cache.as_ref().unwrap().read, Some(500));
+    }
+
+    #[test]
     fn test_message_data_minimal() {
         let raw = r#"{"role": "user"}"#;
         let msg: MessageData = serde_json::from_str(raw).unwrap();
-        assert_eq!(msg.role.as_deref(), Some("user"));
         assert!(msg.tokens.is_none());
         assert!(msg.time.is_none());
         assert!(msg.model_id.is_none());
+    }
+
+    #[test]
+    fn test_detect_v1_message_storage() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch("CREATE TABLE message (id TEXT PRIMARY KEY, data TEXT NOT NULL);")
+            .unwrap();
+        assert_eq!(detect_message_storage(&conn).unwrap(), MessageStorage::V1);
+    }
+
+    #[test]
+    fn test_detect_v2_message_storage() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE message (id TEXT PRIMARY KEY, data TEXT NOT NULL);
+             CREATE TABLE session_message (id TEXT PRIMARY KEY, data TEXT NOT NULL);
+             INSERT INTO session_message VALUES ('msg_test', '{}');",
+        )
+        .unwrap();
+        assert_eq!(detect_message_storage(&conn).unwrap(), MessageStorage::V2);
+    }
+
+    #[test]
+    fn test_v2_database_end_to_end() {
+        let unique = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let db_path = std::env::temp_dir().join(format!(
+            "opencode-token-dashboard-{}-{unique}.db",
+            std::process::id()
+        ));
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE session (
+                id TEXT PRIMARY KEY,
+                parent_id TEXT,
+                directory TEXT NOT NULL,
+                title TEXT NOT NULL
+             );
+             CREATE TABLE session_message (
+                id TEXT PRIMARY KEY,
+                session_id TEXT NOT NULL,
+                type TEXT NOT NULL,
+                seq INTEGER NOT NULL,
+                time_created INTEGER NOT NULL,
+                data TEXT NOT NULL
+             );
+             INSERT INTO session VALUES ('ses_test', NULL, '/tmp/project', 'V2 fixture');",
+        )
+        .unwrap();
+        let rows = [
+            (
+                "msg_user",
+                "user",
+                1,
+                1_000,
+                r#"{"time":{"created":1000},"text":"hello","files":[],"agents":[]}"#,
+            ),
+            (
+                "msg_assistant_1",
+                "assistant",
+                2,
+                2_000,
+                r#"{"time":{"created":2000,"completed":3000},"agent":"build","model":{"id":"model-a","providerID":"provider-a"},"content":[{"type":"text","text":"first"}],"tokens":{"input":100,"output":20,"reasoning":5,"cache":{"read":50,"write":0}}}"#,
+            ),
+            (
+                "msg_assistant_2",
+                "assistant",
+                3,
+                4_000,
+                r#"{"time":{"created":4000,"completed":5000},"agent":"build","model":{"id":"model-a","providerID":"provider-a"},"content":[{"type":"text","text":"second"},{"type":"tool","id":"call_test","name":"shell","state":{"status":"completed","input":{"command":"pwd"},"content":[{"type":"text","text":"/tmp/project"}],"structured":{}},"time":{"created":4100,"completed":4200}}],"tokens":{"input":30,"output":10,"reasoning":0,"cache":{"read":170,"write":0}}}"#,
+            ),
+        ];
+        for (id, message_type, seq, created, data) in rows {
+            conn.execute(
+                "INSERT INTO session_message VALUES (?, 'ses_test', ?, ?, ?, ?)",
+                rusqlite::params![id, message_type, seq, created, data],
+            )
+            .unwrap();
+        }
+        drop(conn);
+
+        let usage = aggregate_usage(&db_path, None).unwrap();
+        assert_eq!(usage.summary.total, 385);
+        assert_eq!(usage.summary.user_message_count, 1);
+        assert_eq!(usage.summary.cache_miss, 5);
+        assert_eq!(usage.summary.cache_expected, 175);
+        assert_eq!(usage.models[0].name, "model-a");
+        assert_eq!(usage.providers[0].name, "provider-a");
+
+        let sessions = aggregate_cache_miss_sessions(&db_path, None, None, None, None).unwrap();
+        assert_eq!(sessions.sessions.len(), 1);
+        assert_eq!(sessions.sessions[0].cache_miss, 5);
+        assert_eq!(sessions.sessions[0].cache_expected, 175);
+
+        let detail = aggregate_cache_miss_session_detail(&db_path, "ses_test").unwrap();
+        assert_eq!(detail.messages.len(), 2);
+        assert_eq!(detail.messages[1].miss, Some(5));
+
+        let content = get_message_content(&db_path, "msg_assistant_2").unwrap();
+        assert_eq!(content.metadata.model.as_deref(), Some("model-a"));
+        assert_eq!(content.parts.len(), 2);
+        assert_eq!(content.parts[1].name.as_deref(), Some("shell"));
+        assert_eq!(content.parts[1].output.as_deref(), Some("/tmp/project"));
+
+        std::fs::remove_file(db_path).unwrap();
     }
 
     // ── JSON serialization (snake_case for metrics, camelCase for meta) ──
@@ -2386,6 +2692,8 @@ mod tests {
             reasoning: 0,
             cache_read: 50,
             cache_write: 0,
+            cache_miss: 0,
+            cache_expected: 0,
             runtime: 1000,
             runtime_dedup: 800,
             user_message_count: 5,
@@ -2439,6 +2747,8 @@ mod tests {
                 reasoning: 0,
                 cache_read: 50,
                 cache_write: 0,
+                cache_miss: 0,
+                cache_expected: 0,
                 runtime: 1000,
                 runtime_dedup: 800,
                 user_message_count: 5,

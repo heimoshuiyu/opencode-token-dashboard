@@ -71,7 +71,7 @@ Every request re-sends the previous round's complete conversation (including the
 
 - [Rust](https://rustup.rs/) (edition 2024)
 - [Node.js](https://nodejs.org/) ≥ 20
-- [OpenCode](https://github.com/anomalyco/opencode) installed and used at least once (requires `~/.local/share/opencode/opencode.db`)
+- [OpenCode](https://github.com/anomalyco/opencode) installed and used at least once (V1 and V2 databases are supported)
 
 ### Development Mode
 
@@ -121,9 +121,16 @@ The Windows build automatically opens a browser on launch. The data directory is
 | `HOST` | `127.0.0.1` | Listen address |
 | `PORT` | `8765` | Listen port |
 | `STATIC_DIR` | — | Set to any value to enable filesystem-based static assets (for dev hot-reload) |
+| `OPENCODE_DB_PATH` | auto-detected | Explicit OpenCode SQLite database path |
 
 ```bash
 HOST=0.0.0.0 PORT=9000 ./target/release/opencode-token-dashboard
+```
+
+OpenCode V2 development channels may use names such as `opencode-local.db`. The dashboard automatically selects the most recently active `opencode*.db` file, including WAL activity. Set `OPENCODE_DB_PATH` when you want to pin a specific channel database:
+
+```bash
+OPENCODE_DB_PATH="$HOME/.local/share/opencode/opencode-local.db" ./target/release/opencode-token-dashboard
 ```
 
 ## Project Structure
@@ -203,13 +210,13 @@ Ideally, `cur` reads back all of `prev`'s context from cache (`cache_read ≈ pr
 
 ## Statistics Notes
 
-- Data source: The `data.tokens` field in the `message` table of the OpenCode database
+- Data source: `message.data.tokens` on OpenCode V1, or `session_message.data.tokens` on OpenCode V2
 - Scope: Assistant messages (excludes `.opencode` internal sessions)
 - Sub-agent tokens are counted; runtime is not (to avoid duplication)
 - Dates/times use the local timezone
 - When `tokens.total` is missing or ≤ 0, falls back to summing `input + output + reasoning + cache_read + cache_write`
 - 7-day range uses hourly granularity with automatic gap-filling; other ranges use daily granularity
-- API responses are cached based on database file mtime + size signature; unchanged data returns cached results
+- API responses are cached based on database and WAL mtime + size signatures; unchanged data returns cached results
 
 ## License
 

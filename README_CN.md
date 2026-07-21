@@ -83,7 +83,7 @@ DeepSeek 官方文档明确写道：在"模型输出末尾"也会建立缓存单
 
 - [Rust](https://rustup.rs/) (edition 2024)
 - [Node.js](https://nodejs.org/) ≥ 20
-- [OpenCode](https://github.com/anomalyco/opencode) 已安装并使用过（需要 `~/.local/share/opencode/opencode.db`）
+- [OpenCode](https://github.com/anomalyco/opencode) 已安装并使用过（兼容 V1 与 V2 数据库）
 
 ### 开发模式
 
@@ -133,9 +133,16 @@ Windows 版本启动后会自动打开浏览器。数据目录为 `%USERPROFILE%
 | `HOST` | `127.0.0.1` | 监听地址 |
 | `PORT` | `8765` | 监听端口 |
 | `STATIC_DIR` | — | 设为任意值启用文件系统静态资源（开发热更新用） |
+| `OPENCODE_DB_PATH` | 自动检测 | 显式指定 OpenCode SQLite 数据库路径 |
 
 ```bash
 HOST=0.0.0.0 PORT=9000 ./target/release/opencode-token-dashboard
+```
+
+OpenCode V2 的开发 channel 可能使用 `opencode-local.db` 等文件名。看板会自动选择最近活跃的 `opencode*.db`，并将 WAL 更新纳入判断。如需固定读取某个 channel，可显式指定：
+
+```bash
+OPENCODE_DB_PATH="$HOME/.local/share/opencode/opencode-local.db" ./target/release/opencode-token-dashboard
 ```
 
 ## 项目结构
@@ -215,13 +222,13 @@ total    = input + output + reasoning + cache_read + cache_write
 
 ## 统计说明
 
-- 数据来源：OpenCode 数据库中 `message` 表的 `data.tokens` 字段
+- 数据来源：OpenCode V1 的 `message.data.tokens`，或 OpenCode V2 的 `session_message.data.tokens`
 - 统计范围：assistant 消息（排除 `.opencode` 内部会话）
 - 子 agent 的 Token 计入统计，运行时长不计入（避免重复）
 - 日期/时间使用本机时区
 - 当 `tokens.total` 缺失或 ≤ 0 时，回退到 `input + output + reasoning + cache_read + cache_write` 求和
 - 7 天范围使用小时粒度，自动填充缺失时段；其他范围按天填充
-- API 响应带缓存，基于数据库文件的 mtime + size 签名，数据不变时直接返回缓存
+- API 响应带缓存，基于数据库文件与 WAL 的 mtime + size 签名，数据不变时直接返回缓存
 
 ## License
 
