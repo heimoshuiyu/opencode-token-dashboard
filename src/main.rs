@@ -643,23 +643,36 @@ fn table_exists(conn: &rusqlite::Connection, table: &str) -> Result<bool, String
     .map_err(|e| format!("检查数据库表失败: {e}"))
 }
 
+fn table_row_count(conn: &rusqlite::Connection, table: &str) -> Result<i64, String> {
+    conn.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| row.get(0))
+        .map_err(|e| format!("统计 {table} 行数失败: {e}"))
+}
+
+/// Decide whether this database stores messages in the V1 schema (`message` +
+/// `part`) or the V2 schema (`session_message` with embedded `content`).
+///
+/// OpenCode migration copies V1 data into `session_message`, but the source
+/// `message` table is left behind as a residue. Some channels therefore have
+/// BOTH tables populated. We pick the schema whose table holds more rows,
+/// falling back to V2 only when V1 is absent — this matches the channel's
+/// active writer instead of mis-reading stale migration leftovers.
 fn detect_message_storage(conn: &rusqlite::Connection) -> Result<MessageStorage, String> {
-    if table_exists(conn, "session_message")? {
-        let has_v2_messages = conn
-            .query_row(
-                "SELECT EXISTS(SELECT 1 FROM session_message LIMIT 1)",
-                [],
-                |row| row.get::<_, bool>(0),
-            )
-            .map_err(|e| format!("检查 v2 消息表失败: {e}"))?;
-        if has_v2_messages || !table_exists(conn, "message")? {
-            return Ok(MessageStorage::V2);
+    let v1_exists = table_exists(conn, "message")?;
+    let v2_exists = table_exists(conn, "session_message")?;
+    match (v1_exists, v2_exists) {
+        (true, true) => {
+            let v1_rows = table_row_count(conn, "message")?;
+            let v2_rows = table_row_count(conn, "session_message")?;
+            if v2_rows > v1_rows {
+                Ok(MessageStorage::V2)
+            } else {
+                Ok(MessageStorage::V1)
+            }
         }
+        (true, false) => Ok(MessageStorage::V1),
+        (false, true) => Ok(MessageStorage::V2),
+        (false, false) => Err("OpenCode 数据库中没有找到 message 或 session_message 表".into()),
     }
-    if table_exists(conn, "message")? {
-        return Ok(MessageStorage::V1);
-    }
-    Err("OpenCode 数据库中没有找到 message 或 session_message 表".into())
 }
 
 /// Build an `AssistantEntry` from a parsed assistant message. Returns `None`
@@ -2591,6 +2604,41 @@ mod tests {
         )
         .unwrap();
         assert_eq!(detect_message_storage(&conn).unwrap(), MessageStorage::V2);
+    }
+
+    /// Mixed-schema channel: migration left an empty/populated V1 `message`
+    /// table alongside a larger V2 `session_message`. Must pick V2 because
+    /// that is where the active writer appends rows.
+    #[test]
+    fn test_detect_message_storage_picks_more_populated_table() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE message (id TEXT PRIMARY KEY, data TEXT NOT NULL);
+             CREATE TABLE session_message (id TEXT PRIMARY KEY, data TEXT NOT NULL);
+             INSERT INTO message VALUES ('m1', '{}');
+             INSERT INTO message VALUES ('m2', '{}');
+             INSERT INTO session_message VALUES ('s1', '{}');
+             INSERT INTO session_message VALUES ('s2', '{}');
+             INSERT INTO session_message VALUES ('s3', '{}');",
+        )
+        .unwrap();
+        assert_eq!(detect_message_storage(&conn).unwrap(), MessageStorage::V2);
+    }
+
+    /// Real-world residue: V1 channel with stale migration leftovers in
+    /// `session_message`. The V1 table has the bulk of history and must win.
+    #[test]
+    fn test_detect_message_storage_prefers_v1_on_residue() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE message (id TEXT PRIMARY KEY, data TEXT NOT NULL);
+             CREATE TABLE session_message (id TEXT PRIMARY KEY, data TEXT NOT NULL);
+             INSERT INTO message VALUES ('m1', '{}');
+             INSERT INTO message VALUES ('m2', '{}');
+             INSERT INTO session_message VALUES ('s1', '{}');",
+        )
+        .unwrap();
+        assert_eq!(detect_message_storage(&conn).unwrap(), MessageStorage::V1);
     }
 
     #[test]
