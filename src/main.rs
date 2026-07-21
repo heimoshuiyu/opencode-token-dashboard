@@ -3,6 +3,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::SystemTime;
 
+use rayon::prelude::*;
+
 use axum::extract::{Query, State};
 use axum::http::{StatusCode, header};
 use axum::response::{IntoResponse, Json};
@@ -997,9 +999,104 @@ fn load_compaction_times(
     Ok(map)
 }
 
+/// Per-database result from `load_database_usage`. Collected in parallel
+/// across databases and merged by `aggregate_usage`.
+struct DatabaseUsage {
+    entries: Vec<AssistantEntry>,
+    user_message_days: HashMap<String, i64>,
+    heatmap_user_messages: HashMap<String, i64>,
+    first_day: Option<String>,
+    last_day: Option<String>,
+    scanned_rows: i64,
+}
+
+/// Load + locally process a single database: scan messages, pair cache-miss,
+/// and filter user messages. Returns the db-local streams that the caller
+/// will merge across databases. Disk-bound work, safe to run in parallel.
+fn load_database_usage(
+    db_path: &Path,
+    hourly: bool,
+    heatmap_hourly: bool,
+) -> Result<DatabaseUsage, String> {
+    let conn = rusqlite_connection(db_path)?;
+    let storage = detect_message_storage(&conn)?;
+    let (mut entries, user_rows, child_session_ids, first_day, last_day, scanned_rows) =
+        load_messages(&conn, storage, hourly, heatmap_hourly)?;
+    let compaction_times = load_compaction_times(&conn, storage)?;
+    pair_cache_miss(&mut entries, &compaction_times);
+
+    // V1 needs the part-table validity filter. V2 has a distinct `synthetic`
+    // message type, so every row loaded as `user` is a real user message.
+    let valid_user_message_ids: HashSet<String> = match storage {
+        MessageStorage::V2 => user_rows.iter().map(|(id, _, _)| id.clone()).collect(),
+        MessageStorage::V1 => {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT DISTINCT p.message_id FROM part p \
+                     JOIN message m ON p.message_id = m.id \
+                     JOIN session s ON m.session_id = s.id \
+                     WHERE m.data LIKE '%\"role\":\"user\"%' \
+                     AND s.directory NOT LIKE '%.opencode%' \
+                     AND s.directory NOT LIKE '/home/hmsy/.config/pet%' \
+                     AND json_extract(p.data, '$.type') IN ('text', 'file') \
+                     AND (json_extract(p.data, '$.synthetic') IS NULL OR json_extract(p.data, '$.synthetic') != 1)",
+                )
+                .map_err(|e| format!("查询有效用户消息失败: {e}"))?;
+            let rows = stmt
+                .query_map([], |row| row.get::<_, String>(0))
+                .map_err(|e| format!("执行查询失败: {e}"))?;
+            rows.filter_map(|r| r.ok()).collect()
+        }
+    };
+
+    let mut user_message_days: HashMap<String, i64> = HashMap::new();
+    let mut heatmap_user_messages: HashMap<String, i64> = HashMap::new();
+    for (id, session_id, raw_data) in &user_rows {
+        if !valid_user_message_ids.contains(id) {
+            continue;
+        }
+        if child_session_ids.contains(session_id) {
+            continue;
+        }
+        let payload: MessageData = match serde_json::from_str(raw_data.as_str()) {
+            Ok(p) => p,
+            Err(_) => continue,
+        };
+        let timestamp_ms = payload
+            .time
+            .as_ref()
+            .and_then(|t| t.completed.or(t.created))
+            .unwrap_or(0);
+        if timestamp_ms == 0 {
+            continue;
+        }
+        let day = if hourly { format_hour(timestamp_ms) } else { format_day(timestamp_ms) };
+        *user_message_days.entry(day).or_insert(0) += 1;
+        let hm_bucket = if heatmap_hourly { format_2h_block(timestamp_ms) } else { format_day(timestamp_ms) };
+        *heatmap_user_messages.entry(hm_bucket).or_insert(0) += 1;
+    }
+
+    Ok(DatabaseUsage {
+        entries,
+        user_message_days,
+        heatmap_user_messages,
+        first_day,
+        last_day,
+        scanned_rows,
+    })
+}
+
 fn aggregate_usage(db_paths: &[PathBuf], range_value: Option<&str>) -> Result<UsagePayload, String> {
     let hourly = is_hourly_range(range_value);
     let heatmap_hourly = heatmap_is_hourly(range_value);
+
+    // Per-database scan is disk-bound and dominates wall time on cold caches.
+    // Run each database's scan on its own rayon worker so two large channels
+    // progress in parallel instead of serially.
+    let db_results: Vec<DatabaseUsage> = db_paths
+        .par_iter()
+        .map(|db_path| load_database_usage(db_path, hourly, heatmap_hourly))
+        .collect::<Result<Vec<_>, _>>()?;
 
     let mut day_totals: HashMap<String, Metrics> = HashMap::new();
     let mut model_totals: HashMap<String, Metrics> = HashMap::new();
@@ -1012,98 +1109,29 @@ fn aggregate_usage(db_paths: &[PathBuf], range_value: Option<&str>) -> Result<Us
     let mut heatmap_totals: HashMap<String, Metrics> = HashMap::new();
     let mut heatmap_user_messages: HashMap<String, i64> = HashMap::new();
 
-    // Aggregated across all databases. assistant_entries from every db are
-    // concatenated; pair_cache_miss groups by session_id internally, and
-    // session IDs are globally unique (verified for opencode V1↔V2 channels),
-    // so no cross-database pairing collision occurs.
+    // Merge per-db streams into the global ones.
     let mut assistant_entries: Vec<AssistantEntry> = Vec::new();
     let mut first_day: Option<String> = None;
     let mut last_day: Option<String> = None;
     let mut scanned_rows: i64 = 0;
     let mut seen_message_ids: HashSet<String> = HashSet::new();
 
-    for db_path in db_paths {
-        let conn = rusqlite_connection(db_path)?;
-        let storage = detect_message_storage(&conn)?;
-
-        let (mut entries, user_rows, child_session_ids, db_first_day, db_last_day, db_scanned) =
-            load_messages(&conn, storage, hourly, heatmap_hourly)?;
-
-        let compaction_times = load_compaction_times(&conn, storage)?;
-        pair_cache_miss(&mut entries, &compaction_times);
-
-        // Merge day bounds across databases (track the global span so the
-        // range window resolves against the combined history).
-        if let Some(fd) = db_first_day {
-            first_day = Some(first_day.map_or(fd.clone(), |existing| existing.min(fd)));
+    for db in db_results {
+        if let Some(fd) = db.first_day {
+            first_day = Some(first_day.map_or(fd.clone(), |existing: String| existing.min(fd)));
         }
-        if let Some(ld) = db_last_day {
-            last_day = Some(last_day.map_or(ld.clone(), |existing| existing.max(ld)));
+        if let Some(ld) = db.last_day {
+            last_day = Some(last_day.map_or(ld.clone(), |existing: String| existing.max(ld)));
         }
-        scanned_rows += db_scanned;
+        scanned_rows += db.scanned_rows;
 
-        // V1 needs the part-table validity filter. V2 has a distinct `synthetic`
-        // message type, so every row loaded as `user` is a real user message.
-        let valid_user_message_ids: HashSet<String> = match storage {
-            MessageStorage::V2 => user_rows.iter().map(|(id, _, _)| id.clone()).collect(),
-            MessageStorage::V1 => {
-                let mut stmt = conn
-                    .prepare(
-                        "SELECT DISTINCT p.message_id FROM part p \
-                         JOIN message m ON p.message_id = m.id \
-                         JOIN session s ON m.session_id = s.id \
-                         WHERE m.data LIKE '%\"role\":\"user\"%' \
-                         AND s.directory NOT LIKE '%.opencode%' \
-                         AND s.directory NOT LIKE '/home/hmsy/.config/pet%' \
-                         AND json_extract(p.data, '$.type') IN ('text', 'file') \
-                         AND (json_extract(p.data, '$.synthetic') IS NULL OR json_extract(p.data, '$.synthetic') != 1)",
-                    )
-                    .map_err(|e| format!("查询有效用户消息失败: {e}"))?;
-
-                let rows = stmt
-                    .query_map([], |row| row.get::<_, String>(0))
-                    .map_err(|e| format!("执行查询失败: {e}"))?;
-
-                rows.filter_map(|r| r.ok()).collect()
-            }
-        };
-
-        // Process user messages collected by the merged scan above.
-        for (id, session_id, raw_data) in &user_rows {
-            if !valid_user_message_ids.contains(id) {
-                continue;
-            }
-
-            if child_session_ids.contains(session_id) {
-                continue;
-            }
-
-            let payload: MessageData = match serde_json::from_str(raw_data.as_str()) {
-                Ok(p) => p,
-                Err(_) => continue,
-            };
-
-            let timestamp_ms = payload
-                .time
-                .as_ref()
-                .and_then(|t| t.completed.or(t.created))
-                .unwrap_or(0);
-
-            if timestamp_ms == 0 {
-                continue;
-            }
-
-            let day = if hourly { format_hour(timestamp_ms) } else { format_day(timestamp_ms) };
-            *user_message_days.entry(day).or_insert(0) += 1;
-
-            let hm_bucket = if heatmap_hourly { format_2h_block(timestamp_ms) } else { format_day(timestamp_ms) };
-            *heatmap_user_messages.entry(hm_bucket).or_insert(0) += 1;
+        for (day, count) in db.user_message_days {
+            *user_message_days.entry(day).or_insert(0) += count;
         }
-
-        // Merge this database's assistant entries into the global stream.
-        // Dedup by message id guards against the rare case where the same
-        // message id appears in two databases (e.g. an export/import cycle).
-        for entry in entries {
+        for (bucket, count) in db.heatmap_user_messages {
+            *heatmap_user_messages.entry(bucket).or_insert(0) += count;
+        }
+        for entry in db.entries {
             if seen_message_ids.insert(entry.id.clone()) {
                 assistant_entries.push(entry);
             }
@@ -1481,6 +1509,40 @@ struct CacheMissSessionDetail {
 }
 
 /// Per-session cache-miss aggregation for the selected range.
+/// Per-database result for cache-miss aggregation. Each field is merged
+/// after parallel collection; session IDs are unique across databases so
+/// title / entry merges never collide in practice.
+struct DatabaseCacheMiss {
+    entries: Vec<AssistantEntry>,
+    titles: HashMap<String, String>,
+    first_day: Option<String>,
+    last_day: Option<String>,
+}
+
+fn load_database_cache_miss(db_path: &Path) -> Result<DatabaseCacheMiss, String> {
+    let conn = rusqlite_connection(db_path)?;
+    let storage = detect_message_storage(&conn)?;
+    let (mut entries, first_day, last_day, _scanned, _child) =
+        load_assistant_entries(&conn, storage, false, false)?;
+    let compaction_times = load_compaction_times(&conn, storage)?;
+    pair_cache_miss(&mut entries, &compaction_times);
+
+    let mut titles: HashMap<String, String> = HashMap::new();
+    let mut stmt = conn
+        .prepare("SELECT id, title FROM session")
+        .map_err(|e| format!("查询 session 失败: {e}"))?;
+    let rows = stmt
+        .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))
+        .map_err(|e| format!("执行查询失败: {e}"))?;
+    for r in rows {
+        if let Ok((id, t)) = r {
+            titles.insert(id, t);
+        }
+    }
+
+    Ok(DatabaseCacheMiss { entries, titles, first_day, last_day })
+}
+
 fn aggregate_cache_miss_sessions(
     db_paths: &[PathBuf],
     range_value: Option<&str>,
@@ -1488,44 +1550,31 @@ fn aggregate_cache_miss_sessions(
     provider_filter: Option<&str>,
     model_filter: Option<&str>,
 ) -> Result<CacheMissSessionsPayload, String> {
+    // Disk-bound scan; parallelize per database.
+    let db_results: Vec<DatabaseCacheMiss> = db_paths
+        .par_iter()
+        .map(|p| load_database_cache_miss(p))
+        .collect::<Result<Vec<_>, _>>()?;
+
     let mut entries: Vec<AssistantEntry> = Vec::new();
     let mut first_day: Option<String> = None;
     let mut last_day: Option<String> = None;
     let mut titles: HashMap<String, String> = HashMap::new();
     let mut seen_message_ids: HashSet<String> = HashSet::new();
 
-    for db_path in db_paths {
-        let conn = rusqlite_connection(db_path)?;
-        let storage = detect_message_storage(&conn)?;
-        let (mut db_entries, db_first_day, db_last_day, _scanned, _child) =
-            load_assistant_entries(&conn, storage, false, false)?;
-        let compaction_times = load_compaction_times(&conn, storage)?;
-        pair_cache_miss(&mut db_entries, &compaction_times);
-
-        for e in db_entries {
+    for db in db_results {
+        for e in db.entries {
             if seen_message_ids.insert(e.id.clone()) {
                 entries.push(e);
             }
         }
-        if let Some(fd) = db_first_day {
-            first_day = Some(first_day.map_or(fd.clone(), |existing| existing.min(fd)));
+        if let Some(fd) = db.first_day {
+            first_day = Some(first_day.map_or(fd.clone(), |existing: String| existing.min(fd)));
         }
-        if let Some(ld) = db_last_day {
-            last_day = Some(last_day.map_or(ld.clone(), |existing| existing.max(ld)));
+        if let Some(ld) = db.last_day {
+            last_day = Some(last_day.map_or(ld.clone(), |existing: String| existing.max(ld)));
         }
-
-        // session titles (merge across databases; later dbs override on conflict)
-        let mut stmt = conn
-            .prepare("SELECT id, title FROM session")
-            .map_err(|e| format!("查询 session 失败: {e}"))?;
-        let rows = stmt
-            .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))
-            .map_err(|e| format!("执行查询失败: {e}"))?;
-        for r in rows {
-            if let Ok((id, t)) = r {
-                titles.insert(id, t);
-            }
-        }
+        titles.extend(db.titles);
     }
 
     // The range window is only used when no exact date filter is given.

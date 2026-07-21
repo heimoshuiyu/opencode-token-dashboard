@@ -15,6 +15,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 mime_guess = "2"
 rust-embed = { version = "8", features = ["mime-guess"] }
+rayon = "1"
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }
