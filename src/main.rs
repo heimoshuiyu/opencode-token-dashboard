@@ -1024,7 +1024,7 @@ fn load_database_usage(
         MessageStorage::V1 => {
             "SELECT m.id, m.session_id, json_extract(m.data, '$.role'), m.data FROM message m \
              JOIN session s ON m.session_id = s.id \
-             WHERE m.data LIKE '%\"role\":\"\"%' \
+             WHERE m.data LIKE '%\"role\":\"%' \
              AND s.directory NOT LIKE '%.opencode%' \
              AND s.directory NOT LIKE '/home/hmsy/.config/pet%' \
              ORDER BY m.session_id ASC, m.time_created ASC"
