@@ -1212,7 +1212,10 @@ fn aggregate_usage(db_paths: &[PathBuf], range_value: Option<&str>) -> Result<Us
         for (k, v) in db.model_day { model_day.entry(k).or_default().add(&v); }
         for (k, v) in db.provider_day { provider_day.entry(k).or_default().add(&v); }
         for (k, day_map) in db.provider_model_day {
-            provider_model_day.entry(k).or_default().extend(day_map.into_iter().map(|(d, m)| (d, m)));
+            let target = provider_model_day.entry(k).or_default();
+            for (bucket, metrics) in day_map {
+                target.entry(bucket).or_default().add(&metrics);
+            }
         }
         for (k, v) in db.heatmap_totals { heatmap_totals.entry(k).or_default().add(&v); }
         for (k, v) in db.day_intervals { day_intervals.entry(k).or_default().extend(v); }
@@ -1223,19 +1226,6 @@ fn aggregate_usage(db_paths: &[PathBuf], range_value: Option<&str>) -> Result<Us
         for (k, v) in db.user_message_days { *user_message_days.entry(k).or_insert(0) += v; }
         for (k, v) in db.heatmap_user_messages { *heatmap_user_messages.entry(k).or_insert(0) += v; }
     }
-
-    // Merge provider_model_day inner maps: same (provider, model) from different
-    // databases need their per-bucket metrics summed.
-    let provider_model_day: HashMap<(String, String), HashMap<String, Metrics>> = {
-        let mut merged: HashMap<(String, String), HashMap<String, Metrics>> = HashMap::new();
-        for ((p, m), day_map) in provider_model_day {
-            let target = merged.entry((p, m)).or_default();
-            for (bucket, metrics) in day_map {
-                target.entry(bucket).or_default().add(&metrics);
-            }
-        }
-        merged
-    };
 
     // ── Resolve day window ─────────────────────────────────────────────
     let (selected_first_day, selected_last_day) = resolve_day_window(
@@ -3465,6 +3455,90 @@ mod tests {
             "summary input should equal sum of day inputs");
         assert_eq!(payload.summary.user_message_count, user_msg_from_days,
             "summary user_message_count should equal sum of day counts");
+    }
+
+    // ── Multi-database merge tests ──────────────────────────────────────
+
+    /// Create a V2 database fixture with assistant messages for the same
+    /// (provider, model) on the same day. Returns the temp DB path.
+    fn make_v2_db(prefix: &str, session_id: &str, msg_id_base: &str) -> PathBuf {
+        let unique = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let db_path = std::env::temp_dir().join(format!(
+            "opencode-dashboard-{prefix}-{unique}.db"
+        ));
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE session (
+                id TEXT PRIMARY KEY,
+                parent_id TEXT,
+                directory TEXT NOT NULL,
+                title TEXT NOT NULL
+             );
+             CREATE TABLE session_message (
+                id TEXT PRIMARY KEY,
+                session_id TEXT NOT NULL,
+                type TEXT NOT NULL,
+                seq INTEGER NOT NULL,
+                time_created INTEGER NOT NULL,
+                data TEXT NOT NULL
+             );",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO session VALUES (?, NULL, '/tmp/project', 'test')",
+            rusqlite::params![session_id],
+        )
+        .unwrap();
+        // Two assistant messages in the same session, same model/provider.
+        let ts = 1_000_000_000_000i64;
+        for i in 0..2i64 {
+            let created = ts + i * 1000;
+            let completed = created + 1000;
+            let data = r#"{"time":{"created":CREATED,"completed":COMPLETED},"model":{"id":"model-x","providerID":"prov-x"},"content":[],"tokens":{"input":100,"output":10,"reasoning":0,"cache":{"read":50,"write":0}}}"#
+                .replace("CREATED", &created.to_string())
+                .replace("COMPLETED", &completed.to_string());
+            conn.execute(
+                "INSERT INTO session_message VALUES (?, ?, 'assistant', ?, ?, ?)",
+                rusqlite::params![format!("{msg_id_base}_{i}"), session_id, i, created, data],
+            )
+            .unwrap();
+        }
+        drop(conn);
+        db_path
+    }
+
+    #[test]
+    fn test_multi_db_provider_model_merge() {
+        // Two databases with the SAME (provider, model) on the SAME day.
+        // Metrics must be SUMMED, not overwritten.
+        let db1 = make_v2_db("pmm1", "ses_A", "msgA");
+        let db2 = make_v2_db("pmm2", "ses_B", "msgB");
+
+        let payload = aggregate_usage(&[db1.clone(), db2.clone()], None).unwrap();
+
+        // Each DB has 2 assistant messages with input=100 each.
+        // Total input should be 400 (2 msgs × 100 × 2 dbs).
+        assert_eq!(payload.summary.input, 400,
+            "multi-db provider_model merge: input should be summed across DBs");
+
+        // providerModels should have one entry for prov-x/model-x.
+        assert_eq!(payload.provider_models.len(), 1);
+        assert_eq!(payload.provider_models[0].provider, "prov-x");
+        assert_eq!(payload.provider_models[0].model, "model-x");
+        assert_eq!(payload.provider_models[0].metrics.input, 400);
+
+        // providerModelTrends should also be correct.
+        assert_eq!(payload.provider_model_trends.len(), 1);
+        let trend_total: i64 = payload.provider_model_trends[0]
+            .days.iter().map(|d| d.metrics.input).sum();
+        assert_eq!(trend_total, 400);
+
+        // Clean up
+        let _ = std::fs::remove_file(&db1);
+        let _ = std::fs::remove_file(&db2);
     }
 
     // ── HTTP handler tests (using axum test utilities) ───────────────────
