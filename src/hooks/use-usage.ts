@@ -1,5 +1,5 @@
 import { useEffect, useState, useCallback } from "react";
-import type { UsagePayload } from "@/types";
+import type { UsagePayload, MetricSummary } from "@/types";
 import { translate, type Locale } from "@/lib/i18n";
 
 function getLocale(): Locale {
@@ -17,27 +17,18 @@ function computeCacheHitRate(entry: { input: number; cache_read: number; cache_w
   return Math.round(((entry.cache_read || 0) + (entry.cache_write || 0)) / inputTotal * 1000) / 10;
 }
 
-function injectCacheHitRate<T extends { input: number; cache_read: number; cache_write: number }>(entry: T): T & { cache_hit_rate: number } {
-  return { ...entry, cache_hit_rate: computeCacheHitRate(entry) };
-}
-
 function enrichPayload(payload: UsagePayload): UsagePayload {
-  const summary = injectCacheHitRate(payload.summary);
-  const days = payload.days.map(injectCacheHitRate);
-  const models = payload.models.map(injectCacheHitRate);
-  const providers = payload.providers.map(injectCacheHitRate);
-  const providerModels = (payload.providerModels || []).map(injectCacheHitRate);
-  const providerModelTrends = (payload.providerModelTrends || []).map((trend) => ({
-    ...trend,
-    days: trend.days.map(injectCacheHitRate),
-  }));
-  const heatmapData = (payload.heatmap?.data || []).map(injectCacheHitRate);
-  const heatmap = {
-    granularity: payload.heatmap?.granularity ?? "daily",
-    intervalHours: payload.heatmap?.intervalHours ?? 24,
-    data: heatmapData,
+  const addHitRate = (e: MetricSummary) => {
+    e.cache_hit_rate = computeCacheHitRate(e);
   };
-  return { ...payload, summary, days, models, providers, providerModels, providerModelTrends, heatmap };
+  addHitRate(payload.summary);
+  payload.days.forEach(addHitRate);
+  payload.models.forEach(addHitRate);
+  payload.providers.forEach(addHitRate);
+  (payload.providerModels || []).forEach(addHitRate);
+  (payload.providerModelTrends || []).forEach((trend) => trend.days.forEach(addHitRate));
+  (payload.heatmap?.data || []).forEach(addHitRate);
+  return payload;
 }
 
 export function useUsage(range: string) {

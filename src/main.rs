@@ -201,7 +201,7 @@ struct CacheMissQuery {
 
 struct CacheEntry {
     signature: String,
-    payload: UsagePayload,
+    payload: Arc<UsagePayload>,
 }
 
 struct AppState {
@@ -389,6 +389,65 @@ fn pair_cache_miss(entries: &mut [AssistantEntry], compactions: &HashMap<String,
         let cur_read = cur.metrics.cache_read;
         entries[ci].metrics.cache_expected = prev_total;
         entries[ci].metrics.cache_miss = (prev_total - cur_read).max(0);
+    }
+}
+
+// ── Streaming cache-miss pairer ────────────────────────────────────────────
+
+/// Streaming cache-miss pairer. Processes entries ordered by (session_id,
+/// ts_ms) and emits finalized entries with cache_expected / cache_miss
+/// computed.  Maintains **O(1)** state: exactly one pending entry (the last
+/// non-zero assistant message in the current session).  When a new session
+/// begins the old pending is flushed; within a session the pairer tries to
+/// pair each incoming entry against the pending one.
+struct CacheMissPairer<'a> {
+    pending: Option<AssistantEntry>,
+    compactions: &'a HashMap<String, Vec<i64>>,
+}
+
+impl<'a> CacheMissPairer<'a> {
+    fn new(compactions: &'a HashMap<String, Vec<i64>>) -> Self {
+        Self { pending: None, compactions }
+    }
+
+    /// Feed the next assistant entry (must arrive in session_id then ts_ms
+    /// order).  Returns the previous pending entry, now finalized.  Zero-total
+    /// entries pass through immediately (no pairing).  The returned entry has
+    /// cache_expected / cache_miss set — 0 when the pair was broken or absent.
+    fn push(&mut self, mut entry: AssistantEntry) -> Option<AssistantEntry> {
+        if entry.metrics.total == 0 {
+            return Some(entry);
+        }
+        let session_changed = self
+            .pending
+            .as_ref()
+            .map_or(true, |p| p.session_id != entry.session_id);
+        if session_changed {
+            return self.pending.replace(entry);
+        }
+        if let Some(ref prev) = self.pending {
+            if prev.metrics.cache_read > 0
+                && entry.model == prev.model
+                && entry.provider == prev.provider
+                && !self.compaction_between(&entry.session_id, prev.ts_ms, entry.ts_ms)
+            {
+                let prev_total = prev.metrics.total;
+                entry.metrics.cache_expected = prev_total;
+                entry.metrics.cache_miss = (prev_total - entry.metrics.cache_read).max(0);
+            }
+        }
+        self.pending.replace(entry)
+    }
+
+    /// Drain the last pending entry at end of stream.
+    fn finish(self) -> Option<AssistantEntry> {
+        self.pending
+    }
+
+    fn compaction_between(&self, session_id: &str, prev_ts: i64, cur_ts: i64) -> bool {
+        self.compactions
+            .get(session_id)
+            .is_some_and(|times| times.iter().any(|&c| c > prev_ts && c < cur_ts))
     }
 }
 
@@ -844,121 +903,6 @@ fn load_assistant_entries(
     Ok((entries, first_day, last_day, scanned_rows, child_session_ids))
 }
 
-/// Single-pass load of BOTH assistant and user messages from the active message
-/// table (`message` on V1, `session_message` on V2).
-///
-/// Returns `(assistant_entries, user_rows, child_session_ids, first_day,
-/// last_day, scanned_rows)` where `user_rows` holds `(id, session_id, data)`
-/// for user messages. V1 counting still applies the `part`-table validity
-/// filter; V2 already separates synthetic messages by type. `scanned_rows`
-/// counts assistant rows, preserving the prior metric's meaning.
-fn load_messages(
-    conn: &rusqlite::Connection,
-    storage: MessageStorage,
-    hourly: bool,
-    heatmap_hourly: bool,
-) -> Result<
-    (
-        Vec<AssistantEntry>,
-        Vec<(String, String, String)>,
-        HashSet<String>,
-        Option<String>,
-        Option<String>,
-        i64,
-    ),
-    String,
-> {
-    let child_session_ids: HashSet<String> = conn
-        .prepare("SELECT id FROM session WHERE parent_id IS NOT NULL")
-        .and_then(|mut stmt| {
-            stmt.query_map([], |row| row.get::<_, String>(0))
-                .map(|rows| rows.filter_map(|r| r.ok()).collect())
-        })
-        .unwrap_or_default();
-
-    // No ORDER BY: it would force SQLite to sort the full result set. The date
-    // bounds are derived via min/max and cache-miss pairing sorts afterwards.
-    let query = match storage {
-        MessageStorage::V1 => {
-            "SELECT m.id, m.session_id, json_extract(m.data, '$.role'), m.data FROM message m \
-             JOIN session s ON m.session_id = s.id \
-             WHERE m.data LIKE '%\"role\":\"%' \
-             AND s.directory NOT LIKE '%.opencode%' \
-             AND s.directory NOT LIKE '/home/hmsy/.config/pet%'"
-        }
-        MessageStorage::V2 => {
-            "SELECT m.id, m.session_id, m.type, m.data FROM session_message m \
-             JOIN session s ON m.session_id = s.id \
-             WHERE m.type IN ('assistant', 'user') \
-             AND s.directory NOT LIKE '%.opencode%' \
-             AND s.directory NOT LIKE '/home/hmsy/.config/pet%'"
-        }
-    };
-    let mut stmt = conn
-        .prepare(query)
-        .map_err(|e| format!("查询消息失败: {e}"))?;
-
-    let rows = stmt
-        .query_map([], |row| {
-            let id: String = row.get(0)?;
-            let session_id: String = row.get(1)?;
-            let message_type: String = row.get(2)?;
-            let data: String = row.get(3)?;
-            Ok((id, session_id, message_type, data))
-        })
-        .map_err(|e| format!("执行查询失败: {e}"))?;
-
-    let mut assistant_entries: Vec<AssistantEntry> = Vec::new();
-    let mut user_rows: Vec<(String, String, String)> = Vec::new();
-    let mut scanned_rows: i64 = 0;
-
-    for row in rows {
-        let (id, session_id, message_type, raw_data) = match row {
-            Ok(r) => r,
-            Err(_) => continue,
-        };
-        let payload: MessageData = match serde_json::from_str(&raw_data) {
-            Ok(p) => p,
-            Err(_) => continue,
-        };
-        match message_type.as_str() {
-            "assistant" => {
-                scanned_rows += 1;
-                if let Some(entry) = build_assistant_entry(
-                    id,
-                    session_id,
-                    &message_type,
-                    &payload,
-                    &child_session_ids,
-                    hourly,
-                    heatmap_hourly,
-                ) {
-                    assistant_entries.push(entry);
-                }
-            }
-            "user" => {
-                user_rows.push((id, session_id, raw_data));
-            }
-            _ => {}
-        }
-    }
-
-    // first_day/last_day = earliest/latest day across assistant entries.
-    // Computed via min/max so the result is correct regardless of row iteration
-    // order (the merged query intentionally has no ORDER BY).
-    let first_day = assistant_entries.iter().map(|e| format_day(e.ts_ms)).min();
-    let last_day = assistant_entries.iter().map(|e| format_day(e.ts_ms)).max();
-
-    Ok((
-        assistant_entries,
-        user_rows,
-        child_session_ids,
-        first_day,
-        last_day,
-        scanned_rows,
-    ))
-}
-
 /// Load per-session compaction timestamps (epoch ms), sorted ascending.
 fn load_compaction_times(
     conn: &rusqlite::Connection,
@@ -1001,8 +945,27 @@ fn load_compaction_times(
 
 /// Per-database result from `load_database_usage`. Collected in parallel
 /// across databases and merged by `aggregate_usage`.
-struct DatabaseUsage {
-    entries: Vec<AssistantEntry>,
+/// Per-database aggregation result.  All maps carry a day component so the
+/// caller can apply a date-range window **after** merging without needing the
+/// original per-message entries.  This replaces the old `Vec<AssistantEntry>`
+/// — peak memory drops from O(messages) to O(days × models).
+struct DatabaseAggregation {
+    day_totals: HashMap<String, Metrics>,
+    /// (model, day) → metrics — roll up to model totals after window filter.
+    model_day: HashMap<(String, String), Metrics>,
+    /// (provider, day) → metrics — roll up to provider totals.
+    provider_day: HashMap<(String, String), Metrics>,
+    /// (provider, model) → (bucket → metrics) for trend chart.
+    provider_model_day: HashMap<(String, String), HashMap<String, Metrics>>,
+    heatmap_totals: HashMap<String, Metrics>,
+    /// (bucket → intervals) for per-day runtime dedup.
+    day_intervals: HashMap<String, Vec<(i64, i64)>>,
+    /// (model, day) → intervals for model runtime dedup.
+    model_day_intervals: HashMap<(String, String), Vec<(i64, i64)>>,
+    /// (provider, day) → intervals for provider runtime dedup.
+    provider_day_intervals: HashMap<(String, String), Vec<(i64, i64)>>,
+    heatmap_intervals: HashMap<String, Vec<(i64, i64)>>,
+    assistant_count_per_day: HashMap<String, i64>,
     user_message_days: HashMap<String, i64>,
     heatmap_user_messages: HashMap<String, i64>,
     first_day: Option<String>,
@@ -1010,25 +973,31 @@ struct DatabaseUsage {
     scanned_rows: i64,
 }
 
-/// Load + locally process a single database: scan messages, pair cache-miss,
-/// and filter user messages. Returns the db-local streams that the caller
-/// will merge across databases. Disk-bound work, safe to run in parallel.
+/// Stream rows from a single database: read each message row, pair cache-miss
+/// via [`CacheMissPairer`] (O(1) state), and accumulate into per-day HashMaps
+/// immediately.  No `Vec<AssistantEntry>` is ever materialised.  Disk-bound,
+/// safe to run in parallel across databases.
 fn load_database_usage(
     db_path: &Path,
     hourly: bool,
     heatmap_hourly: bool,
-) -> Result<DatabaseUsage, String> {
+) -> Result<DatabaseAggregation, String> {
     let conn = rusqlite_connection(db_path)?;
     let storage = detect_message_storage(&conn)?;
-    let (mut entries, user_rows, child_session_ids, first_day, last_day, scanned_rows) =
-        load_messages(&conn, storage, hourly, heatmap_hourly)?;
-    let compaction_times = load_compaction_times(&conn, storage)?;
-    pair_cache_miss(&mut entries, &compaction_times);
 
-    // V1 needs the part-table validity filter. V2 has a distinct `synthetic`
-    // message type, so every row loaded as `user` is a real user message.
+    let child_session_ids: HashSet<String> = conn
+        .prepare("SELECT id FROM session WHERE parent_id IS NOT NULL")
+        .and_then(|mut stmt| {
+            stmt.query_map([], |row| row.get::<_, String>(0))
+                .map(|rows| rows.filter_map(|r| r.ok()).collect())
+        })
+        .unwrap_or_default();
+
+    let compaction_times = load_compaction_times(&conn, storage)?;
+
+    // V1 validity filter for user messages.
     let valid_user_message_ids: HashSet<String> = match storage {
-        MessageStorage::V2 => user_rows.iter().map(|(id, _, _)| id.clone()).collect(),
+        MessageStorage::V2 => HashSet::new(),
         MessageStorage::V1 => {
             let mut stmt = conn
                 .prepare(
@@ -1049,244 +1018,331 @@ fn load_database_usage(
         }
     };
 
-    let mut user_message_days: HashMap<String, i64> = HashMap::new();
-    let mut heatmap_user_messages: HashMap<String, i64> = HashMap::new();
-    for (id, session_id, raw_data) in &user_rows {
-        if !valid_user_message_ids.contains(id) {
-            continue;
+    // ORDER BY session_id, time_created so CacheMissPairer sessions are
+    // contiguous — the pairer only needs the immediately preceding entry.
+    let query = match storage {
+        MessageStorage::V1 => {
+            "SELECT m.id, m.session_id, json_extract(m.data, '$.role'), m.data FROM message m \
+             JOIN session s ON m.session_id = s.id \
+             WHERE m.data LIKE '%\"role\":\"\"%' \
+             AND s.directory NOT LIKE '%.opencode%' \
+             AND s.directory NOT LIKE '/home/hmsy/.config/pet%' \
+             ORDER BY m.session_id ASC, m.time_created ASC"
         }
-        if child_session_ids.contains(session_id) {
-            continue;
+        MessageStorage::V2 => {
+            "SELECT m.id, m.session_id, m.type, m.data FROM session_message m \
+             JOIN session s ON m.session_id = s.id \
+             WHERE m.type IN ('assistant', 'user') \
+             AND s.directory NOT LIKE '%.opencode%' \
+             AND s.directory NOT LIKE '/home/hmsy/.config/pet%' \
+             ORDER BY m.session_id ASC, m.time_created ASC"
         }
-        let payload: MessageData = match serde_json::from_str(raw_data.as_str()) {
+    };
+    let mut stmt = conn
+        .prepare(query)
+        .map_err(|e| format!("查询消息失败: {e}"))?;
+
+    let rows = stmt
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+            ))
+        })
+        .map_err(|e| format!("执行查询失败: {e}"))?;
+
+    let mut agg = DatabaseAggregation {
+        day_totals: HashMap::new(),
+        model_day: HashMap::new(),
+        provider_day: HashMap::new(),
+        provider_model_day: HashMap::new(),
+        heatmap_totals: HashMap::new(),
+        day_intervals: HashMap::new(),
+        model_day_intervals: HashMap::new(),
+        provider_day_intervals: HashMap::new(),
+        heatmap_intervals: HashMap::new(),
+        assistant_count_per_day: HashMap::new(),
+        user_message_days: HashMap::new(),
+        heatmap_user_messages: HashMap::new(),
+        first_day: None,
+        last_day: None,
+        scanned_rows: 0,
+    };
+    let mut pairer = CacheMissPairer::new(&compaction_times);
+    let mut scanned_rows: i64 = 0;
+    let v2_user_all_valid = matches!(storage, MessageStorage::V2);
+
+    let accumulate = |entry: &AssistantEntry, agg: &mut DatabaseAggregation| {
+        let AssistantEntry { bucket, model, provider, metrics, interval, heatmap_bucket, .. } = entry;
+        let bucket_day = bucket.split_once('T').map_or(bucket.as_str(), |(d, _)| d);
+        agg.day_totals.entry(bucket.clone()).or_default().add(metrics);
+        agg.model_day
+            .entry((model.clone(), bucket_day.to_string()))
+            .or_default()
+            .add(metrics);
+        agg.provider_day
+            .entry((provider.clone(), bucket_day.to_string()))
+            .or_default()
+            .add(metrics);
+        agg.provider_model_day
+            .entry((provider.clone(), model.clone()))
+            .or_default()
+            .entry(bucket.clone())
+            .or_default()
+            .add(metrics);
+        agg.heatmap_totals
+            .entry(heatmap_bucket.clone())
+            .or_default()
+            .add(metrics);
+        if let Some(iv) = interval {
+            agg.day_intervals.entry(bucket.clone()).or_default().push(*iv);
+            agg.model_day_intervals
+                .entry((model.clone(), bucket_day.to_string()))
+                .or_default()
+                .push(*iv);
+            agg.provider_day_intervals
+                .entry((provider.clone(), bucket_day.to_string()))
+                .or_default()
+                .push(*iv);
+            agg.heatmap_intervals
+                .entry(heatmap_bucket.clone())
+                .or_default()
+                .push(*iv);
+        }
+        *agg.assistant_count_per_day.entry(bucket_day.to_string()).or_insert(0) += 1;
+    };
+
+    for row in rows {
+        let (id, session_id, message_type, raw_data) = match row {
+            Ok(r) => r,
+            Err(_) => continue,
+        };
+        let payload: MessageData = match serde_json::from_str(&raw_data) {
             Ok(p) => p,
             Err(_) => continue,
         };
-        let timestamp_ms = payload
-            .time
-            .as_ref()
-            .and_then(|t| t.completed.or(t.created))
-            .unwrap_or(0);
-        if timestamp_ms == 0 {
-            continue;
+        match message_type.as_str() {
+            "assistant" => {
+                scanned_rows += 1;
+                if let Some(entry) = build_assistant_entry(
+                    id,
+                    session_id,
+                    &message_type,
+                    &payload,
+                    &child_session_ids,
+                    hourly,
+                    heatmap_hourly,
+                ) {
+                    let day = format_day(entry.ts_ms);
+                    agg.first_day = Some(agg.first_day.map_or(day.clone(), |d| d.min(day.clone())));
+                    agg.last_day = Some(agg.last_day.map_or(day.clone(), |d| d.max(day)));
+                    if let Some(finalized) = pairer.push(entry) {
+                        accumulate(&finalized, &mut agg);
+                    }
+                }
+            }
+            "user" => {
+                let ts_ms = payload
+                    .time
+                    .as_ref()
+                    .and_then(|t| t.completed.or(t.created))
+                    .unwrap_or(0);
+                if ts_ms == 0 {
+                    continue;
+                }
+                let valid = v2_user_all_valid || valid_user_message_ids.contains(&id);
+                if !valid || child_session_ids.contains(&session_id) {
+                    continue;
+                }
+                let day = if hourly { format_hour(ts_ms) } else { format_day(ts_ms) };
+                *agg.user_message_days.entry(day).or_insert(0) += 1;
+                let hm_bucket = if heatmap_hourly { format_2h_block(ts_ms) } else { format_day(ts_ms) };
+                *agg.heatmap_user_messages.entry(hm_bucket).or_insert(0) += 1;
+            }
+            _ => {}
         }
-        let day = if hourly { format_hour(timestamp_ms) } else { format_day(timestamp_ms) };
-        *user_message_days.entry(day).or_insert(0) += 1;
-        let hm_bucket = if heatmap_hourly { format_2h_block(timestamp_ms) } else { format_day(timestamp_ms) };
-        *heatmap_user_messages.entry(hm_bucket).or_insert(0) += 1;
     }
 
-    Ok(DatabaseUsage {
-        entries,
-        user_message_days,
-        heatmap_user_messages,
-        first_day,
-        last_day,
-        scanned_rows,
-    })
+    // Flush the last pending entry.
+    if let Some(finalized) = pairer.finish() {
+        accumulate(&finalized, &mut agg);
+    }
+
+    agg.scanned_rows = scanned_rows;
+    Ok(agg)
 }
 
 fn aggregate_usage(db_paths: &[PathBuf], range_value: Option<&str>) -> Result<UsagePayload, String> {
     let hourly = is_hourly_range(range_value);
     let heatmap_hourly = heatmap_is_hourly(range_value);
 
-    // Per-database scan is disk-bound and dominates wall time on cold caches.
-    // Run each database's scan on its own rayon worker so two large channels
-    // progress in parallel instead of serially.
-    let db_results: Vec<DatabaseUsage> = db_paths
+    let db_results: Vec<DatabaseAggregation> = db_paths
         .par_iter()
         .map(|db_path| load_database_usage(db_path, hourly, heatmap_hourly))
         .collect::<Result<Vec<_>, _>>()?;
 
+    // ── Merge per-database HashMaps ────────────────────────────────────
     let mut day_totals: HashMap<String, Metrics> = HashMap::new();
-    let mut model_totals: HashMap<String, Metrics> = HashMap::new();
-    let mut provider_totals: HashMap<String, Metrics> = HashMap::new();
-    let mut provider_model_totals: HashMap<(String, String), Metrics> = HashMap::new();
-    let mut provider_model_day_totals: HashMap<(String, String), HashMap<String, Metrics>> = HashMap::new();
-    let mut user_message_days: HashMap<String, i64> = HashMap::new();
-    // Dedicated heatmap stream. Granularity follows `heatmap_hourly`
-    // (hourly for range ≤ 90, daily for range > 90). Always computed.
+    let mut model_day: HashMap<(String, String), Metrics> = HashMap::new();
+    let mut provider_day: HashMap<(String, String), Metrics> = HashMap::new();
+    let mut provider_model_day: HashMap<(String, String), HashMap<String, Metrics>> = HashMap::new();
     let mut heatmap_totals: HashMap<String, Metrics> = HashMap::new();
+    let mut day_intervals: HashMap<String, Vec<(i64, i64)>> = HashMap::new();
+    let mut model_day_intervals: HashMap<(String, String), Vec<(i64, i64)>> = HashMap::new();
+    let mut provider_day_intervals: HashMap<(String, String), Vec<(i64, i64)>> = HashMap::new();
+    let mut heatmap_intervals: HashMap<String, Vec<(i64, i64)>> = HashMap::new();
+    let mut assistant_count_per_day: HashMap<String, i64> = HashMap::new();
+    let mut user_message_days: HashMap<String, i64> = HashMap::new();
     let mut heatmap_user_messages: HashMap<String, i64> = HashMap::new();
-
-    // Merge per-db streams into the global ones.
-    let mut assistant_entries: Vec<AssistantEntry> = Vec::new();
     let mut first_day: Option<String> = None;
     let mut last_day: Option<String> = None;
     let mut scanned_rows: i64 = 0;
-    let mut seen_message_ids: HashSet<String> = HashSet::new();
 
     for db in db_results {
         if let Some(fd) = db.first_day {
-            first_day = Some(first_day.map_or(fd.clone(), |existing: String| existing.min(fd)));
+            first_day = Some(first_day.map_or(fd.clone(), |e: String| e.min(fd)));
         }
         if let Some(ld) = db.last_day {
-            last_day = Some(last_day.map_or(ld.clone(), |existing: String| existing.max(ld)));
+            last_day = Some(last_day.map_or(ld.clone(), |e: String| e.max(ld)));
         }
         scanned_rows += db.scanned_rows;
-
-        for (day, count) in db.user_message_days {
-            *user_message_days.entry(day).or_insert(0) += count;
+        for (k, v) in db.day_totals { day_totals.entry(k).or_default().add(&v); }
+        for (k, v) in db.model_day { model_day.entry(k).or_default().add(&v); }
+        for (k, v) in db.provider_day { provider_day.entry(k).or_default().add(&v); }
+        for (k, day_map) in db.provider_model_day {
+            provider_model_day.entry(k).or_default().extend(day_map.into_iter().map(|(d, m)| (d, m)));
         }
-        for (bucket, count) in db.heatmap_user_messages {
-            *heatmap_user_messages.entry(bucket).or_insert(0) += count;
-        }
-        for entry in db.entries {
-            if seen_message_ids.insert(entry.id.clone()) {
-                assistant_entries.push(entry);
-            }
-        }
+        for (k, v) in db.heatmap_totals { heatmap_totals.entry(k).or_default().add(&v); }
+        for (k, v) in db.day_intervals { day_intervals.entry(k).or_default().extend(v); }
+        for (k, v) in db.model_day_intervals { model_day_intervals.entry(k).or_default().extend(v); }
+        for (k, v) in db.provider_day_intervals { provider_day_intervals.entry(k).or_default().extend(v); }
+        for (k, v) in db.heatmap_intervals { heatmap_intervals.entry(k).or_default().extend(v); }
+        for (k, v) in db.assistant_count_per_day { *assistant_count_per_day.entry(k).or_insert(0) += v; }
+        for (k, v) in db.user_message_days { *user_message_days.entry(k).or_insert(0) += v; }
+        for (k, v) in db.heatmap_user_messages { *heatmap_user_messages.entry(k).or_insert(0) += v; }
     }
 
-    // Resolve day window
+    // Merge provider_model_day inner maps: same (provider, model) from different
+    // databases need their per-bucket metrics summed.
+    let provider_model_day: HashMap<(String, String), HashMap<String, Metrics>> = {
+        let mut merged: HashMap<(String, String), HashMap<String, Metrics>> = HashMap::new();
+        for ((p, m), day_map) in provider_model_day {
+            let target = merged.entry((p, m)).or_default();
+            for (bucket, metrics) in day_map {
+                target.entry(bucket).or_default().add(&metrics);
+            }
+        }
+        merged
+    };
+
+    // ── Resolve day window ─────────────────────────────────────────────
     let (selected_first_day, selected_last_day) = resolve_day_window(
         first_day.as_deref(),
         last_day.as_deref(),
         range_value,
     );
 
-    // Aggregate within selected window
-    let mut bucket_intervals: HashMap<String, Vec<(i64, i64)>> = HashMap::new();
-    let mut model_intervals: HashMap<String, Vec<(i64, i64)>> = HashMap::new();
-    let mut provider_intervals: HashMap<String, Vec<(i64, i64)>> = HashMap::new();
-    // Intervals for the dedicated heatmap stream (to compute runtime_dedup).
-    let mut heatmap_intervals: HashMap<String, Vec<(i64, i64)>> = HashMap::new();
-    let mut all_intervals: Vec<(i64, i64)> = Vec::new();
-    let mut assistant_rows: i64 = 0;
+    let in_window = |day: &str| -> bool {
+        if let Some(ref sfd) = selected_first_day { if day < sfd.as_str() { return false; } }
+        if let Some(ref sld) = selected_last_day { if day > sld.as_str() { return false; } }
+        true
+    };
 
-    for entry in &assistant_entries {
-        let AssistantEntry { bucket, model, provider, metrics, interval, heatmap_bucket, .. } = entry;
-        // For hourly: bucket is "2026-05-30T14", we need the day part for window check
-        let bucket_day = if hourly {
-            bucket.split_once('T').map(|(d, _)| d).unwrap_or(bucket.as_str())
-        } else {
-            bucket.as_str()
-        };
-        if let Some(ref sfd) = selected_first_day {
-            if bucket_day < sfd.as_str() {
-                continue;
-            }
-        }
-        if let Some(ref sld) = selected_last_day {
-            if bucket_day > sld.as_str() {
-                continue;
-            }
-        }
-
-        // Dedicated heatmap stream (hourly for range ≤ 90, daily for range > 90).
-        heatmap_totals
-            .entry(heatmap_bucket.clone())
-            .or_default()
-            .add(metrics);
-
-        day_totals
-            .entry(bucket.clone())
-            .or_default()
-            .add(metrics);
-        model_totals
-            .entry(model.clone())
-            .or_default()
-            .add(metrics);
-        provider_totals
-            .entry(provider.clone())
-            .or_default()
-            .add(metrics);
-        provider_model_totals
-            .entry((provider.clone(), model.clone()))
-            .or_default()
-            .add(metrics);
-        provider_model_day_totals
-            .entry((provider.clone(), model.clone()))
-            .or_default()
-            .entry(bucket.clone())
-            .or_default()
-            .add(metrics);
-
-        if let Some(iv) = interval {
-            bucket_intervals.entry(bucket.clone()).or_default().push(*iv);
-            heatmap_intervals.entry(heatmap_bucket.clone()).or_default().push(*iv);
-            model_intervals.entry(model.clone()).or_default().push(*iv);
-            provider_intervals
-                .entry(provider.clone())
-                .or_default()
-                .push(*iv);
-            all_intervals.push(*iv);
-        }
-
-        assistant_rows += 1;
+    // ── Build flat totals (window-filtered) from per-day maps ──────────
+    let mut model_totals: HashMap<String, Metrics> = HashMap::new();
+    let mut model_intervals_flat: HashMap<String, Vec<(i64, i64)>> = HashMap::new();
+    for ((model, day), metrics) in &model_day {
+        if !in_window(day) { continue; }
+        model_totals.entry(model.clone()).or_default().add(metrics);
+    }
+    for ((model, day), ivs) in &model_day_intervals {
+        if !in_window(day) { continue; }
+        model_intervals_flat.entry(model.clone()).or_default().extend(ivs.iter().copied());
     }
 
-    // Inject user message counts
+    let mut provider_totals: HashMap<String, Metrics> = HashMap::new();
+    let mut provider_intervals_flat: HashMap<String, Vec<(i64, i64)>> = HashMap::new();
+    for ((provider, day), metrics) in &provider_day {
+        if !in_window(day) { continue; }
+        provider_totals.entry(provider.clone()).or_default().add(metrics);
+    }
+    for ((provider, day), ivs) in &provider_day_intervals {
+        if !in_window(day) { continue; }
+        provider_intervals_flat.entry(provider.clone()).or_default().extend(ivs.iter().copied());
+    }
+
+    let mut provider_model_totals: HashMap<(String, String), Metrics> = HashMap::new();
+    for ((provider, model), day_map) in &provider_model_day {
+        let mut total = Metrics::default();
+        for (bucket, metrics) in day_map {
+            let day = bucket.split_once('T').map_or(bucket.as_str(), |(d, _)| d);
+            if !in_window(day) { continue; }
+            total.add(metrics);
+        }
+        provider_model_totals.entry((provider.clone(), model.clone())).or_default().add(&total);
+    }
+
+    // ── Inject user message counts (window-filtered) ───────────────────
     for (bucket, count) in &user_message_days {
-        let bucket_day = if hourly {
-            bucket.split_once('T').map(|(d, _)| d).unwrap_or(bucket.as_str())
-        } else {
-            bucket.as_str()
-        };
-        if let Some(ref sfd) = selected_first_day {
-            if bucket_day < sfd.as_str() {
-                continue;
-            }
-        }
-        if let Some(ref sld) = selected_last_day {
-            if bucket_day > sld.as_str() {
-                continue;
-            }
-        }
-        day_totals
-            .entry(bucket.clone())
-            .or_default()
-            .user_message_count = *count;
+        let day = bucket.split_once('T').map_or(bucket.as_str(), |(d, _)| d);
+        if !in_window(day) { continue; }
+        day_totals.entry(bucket.clone()).or_default().user_message_count = *count;
     }
-
-    // Inject user message counts into the dedicated heatmap stream.
-    // Keys are either "YYYY-MM-DDTHH" (hourly) or "YYYY-MM-DD" (daily);
-    // the day part is the prefix before 'T' (or the whole key when no 'T').
     for (hm_bucket, count) in &heatmap_user_messages {
-        let hm_day = hm_bucket
-            .split_once('T')
-            .map(|(d, _)| d)
-            .unwrap_or(hm_bucket.as_str());
-        if let Some(ref sfd) = selected_first_day {
-            if hm_day < sfd.as_str() {
-                continue;
-            }
-        }
-        if let Some(ref sld) = selected_last_day {
-            if hm_day > sld.as_str() {
-                continue;
-            }
-        }
-        heatmap_totals
-            .entry(hm_bucket.clone())
-            .or_default()
-            .user_message_count = *count;
+        let day = hm_bucket.split_once('T').map_or(hm_bucket.as_str(), |(d, _)| d);
+        if !in_window(day) { continue; }
+        heatmap_totals.entry(hm_bucket.clone()).or_default().user_message_count = *count;
     }
 
-    // Compute dedup runtime
-    for (bucket, intervals) in &mut bucket_intervals {
+    // ── Compute dedup runtimes ─────────────────────────────────────────
+    for (bucket, intervals) in &mut day_intervals {
         let dedup = merge_intervals(intervals);
         day_totals.entry(bucket.clone()).or_default().runtime_dedup = dedup;
     }
-    for (model, intervals) in &mut model_intervals {
+    for (model, intervals) in &mut model_intervals_flat {
         let dedup = merge_intervals(intervals);
         model_totals.entry(model.clone()).or_default().runtime_dedup = dedup;
     }
-    for (provider, intervals) in &mut provider_intervals {
+    for (provider, intervals) in &mut provider_intervals_flat {
         let dedup = merge_intervals(intervals);
-        provider_totals
-            .entry(provider.clone())
-            .or_default()
-            .runtime_dedup = dedup;
+        provider_totals.entry(provider.clone()).or_default().runtime_dedup = dedup;
     }
     for (hb, intervals) in &mut heatmap_intervals {
         let dedup = merge_intervals(intervals);
         heatmap_totals.entry(hb.clone()).or_default().runtime_dedup = dedup;
     }
 
+    // Overall dedup: flatten all in-window intervals.
+    let mut all_intervals: Vec<(i64, i64)> = Vec::new();
+    for (bucket, ivs) in &day_intervals {
+        let day = bucket.split_once('T').map_or(bucket.as_str(), |(d, _)| d);
+        if in_window(day) { all_intervals.extend(ivs.iter().copied()); }
+    }
     let all_dedup = merge_intervals(&mut all_intervals);
 
-    // Build output — fill missing buckets with zero metrics
+    // assistant_message_count: sum per-day counts within window.
+    let assistant_rows: i64 = assistant_count_per_day.iter()
+        .filter(|(day, _)| in_window(day))
+        .map(|(_, c)| c)
+        .sum();
+
+    // Free intermediates before building output.
+    drop(model_day);
+    drop(provider_day);
+    drop(day_intervals);
+    drop(model_day_intervals);
+    drop(provider_day_intervals);
+    drop(heatmap_intervals);
+    drop(model_intervals_flat);
+    drop(provider_intervals_flat);
+    drop(all_intervals);
+    drop(assistant_count_per_day);
+    drop(user_message_days);
+    drop(heatmap_user_messages);
+
+    // ── Build output ───────────────────────────────────────────────────
     let days: Vec<DayEntry> = if hourly {
         fill_missing_hours(day_totals, selected_first_day.as_deref(), selected_last_day.as_deref())
     } else {
@@ -1332,7 +1388,7 @@ fn aggregate_usage(db_paths: &[PathBuf], range_value: Option<&str>) -> Result<Us
 
     // Build provider_model_trends — daily time series per provider+model
     let provider_model_trends: Vec<ProviderModelTrendEntry> = {
-        let mut trends: Vec<ProviderModelTrendEntry> = provider_model_day_totals
+        let mut trends: Vec<ProviderModelTrendEntry> = provider_model_day
             .into_iter()
             .map(|((provider, model), day_map)| {
                 let mut day_entries: Vec<ProviderModelDayEntry> = day_map
@@ -1439,12 +1495,12 @@ fn rusqlite_connection(db_path: &Path) -> Result<rusqlite::Connection, String> {
     // settings: they do NOT modify the database file or its schema. Errors are
     // ignored so opening never fails in a restricted environment.
     //   temp_store=MEMORY : spill temp B-trees/sorts to memory, not disk
-    //   cache_size=-65536 : ~64MB page cache (negative = kibibytes)
-    //   mmap_size=268435456 : memory-map up to 256MB for faster large-table reads
+    //   cache_size=-16384 : ~16MB page cache (negative = kibibytes)
+    //   mmap_size=67108864 : memory-map up to 64MB for faster large-table reads
     let _ = conn.execute_batch(
         "PRAGMA temp_store = MEMORY;\
-         PRAGMA cache_size = -65536;\
-         PRAGMA mmap_size = 268435456;",
+         PRAGMA cache_size = -16384;\
+         PRAGMA mmap_size = 67108864;",
     );
     Ok(conn)
 }
@@ -2098,7 +2154,7 @@ async fn get_usage_payload(
     state: &AppState,
     db_paths: &[PathBuf],
     range_value: Option<&str>,
-) -> Result<UsagePayload, String> {
+) -> Result<Arc<UsagePayload>, String> {
     fn file_signature(path: &Path) -> String {
         match std::fs::metadata(path) {
             Ok(metadata) => {
@@ -2140,12 +2196,12 @@ async fn get_usage_payload(
         let cache = state.cache.read().await;
         if let Some(cached) = cache.get(&cache_key) {
             if cached.signature == signature {
-                return Ok(cached.payload.clone());
+                return Ok(Arc::clone(&cached.payload));
             }
         }
     }
 
-    let payload = aggregate_usage(db_paths, range_value)?;
+    let payload = Arc::new(aggregate_usage(db_paths, range_value)?);
 
     {
         let mut cache = state.cache.write().await;
@@ -2153,7 +2209,7 @@ async fn get_usage_payload(
             cache_key,
             CacheEntry {
                 signature,
-                payload: payload.clone(),
+                payload: Arc::clone(&payload),
             },
         );
     }
@@ -2646,6 +2702,227 @@ mod tests {
         assert_eq!(m.runtime, 0);
         assert_eq!(m.runtime_dedup, 0);
         assert_eq!(m.user_message_count, 0);
+    }
+
+    // ── CacheMissPairer ─────────────────────────────────────────────────
+
+    /// Helper: create a minimal AssistantEntry for pairer tests.
+    fn pairer_entry(
+        id: &str,
+        session_id: &str,
+        ts_ms: i64,
+        total: i64,
+        cache_read: i64,
+        model: &str,
+        provider: &str,
+    ) -> AssistantEntry {
+        AssistantEntry {
+            id: id.to_string(),
+            session_id: session_id.to_string(),
+            ts_ms,
+            bucket: format_day(ts_ms),
+            heatmap_bucket: format_day(ts_ms),
+            model: model.to_string(),
+            provider: provider.to_string(),
+            metrics: Metrics {
+                total,
+                active: total,
+                input: total,
+                output: 0,
+                reasoning: 0,
+                cache_read,
+                cache_write: 0,
+                cache_miss: 0,
+                cache_expected: 0,
+                runtime: 0,
+                runtime_dedup: 0,
+                user_message_count: 0,
+            },
+            interval: None,
+        }
+    }
+
+    /// Collect all finalized entries from a pairer given an input stream.
+    fn pairer_collect(
+        entries: Vec<AssistantEntry>,
+        compactions: &HashMap<String, Vec<i64>>,
+    ) -> Vec<AssistantEntry> {
+        let mut pairer = CacheMissPairer::new(compactions);
+        let mut out = Vec::new();
+        for entry in entries {
+            if let Some(finalized) = pairer.push(entry) {
+                out.push(finalized);
+            }
+        }
+        if let Some(last) = pairer.finish() {
+            out.push(last);
+        }
+        out
+    }
+
+    #[test]
+    fn test_pairer_basic_pair() {
+        // Two messages in same session: prev has total=200, cache_read=50.
+        // cur should get cache_expected=200, cache_miss=200-170=30.
+        let entries = vec![
+            pairer_entry("m1", "s1", 1000, 200, 50, "model-a", "prov-a"),
+            pairer_entry("m2", "s1", 2000, 175, 170, "model-a", "prov-a"),
+        ];
+        let out = pairer_collect(entries, &HashMap::new());
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0].metrics.cache_expected, 0); // m1: first message, no pair
+        assert_eq!(out[0].metrics.cache_miss, 0);
+        assert_eq!(out[1].metrics.cache_expected, 200); // m2: paired with m1
+        assert_eq!(out[1].metrics.cache_miss, 30); // 200 - 170
+    }
+
+    #[test]
+    fn test_pairer_cold_start_skipped() {
+        // prev has cache_read=0 (cold start) → pair should be broken.
+        let entries = vec![
+            pairer_entry("m1", "s1", 1000, 200, 0, "model-a", "prov-a"), // cold start
+            pairer_entry("m2", "s1", 2000, 175, 170, "model-a", "prov-a"),
+        ];
+        let out = pairer_collect(entries, &HashMap::new());
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[1].metrics.cache_expected, 0); // not paired
+        assert_eq!(out[1].metrics.cache_miss, 0);
+    }
+
+    #[test]
+    fn test_pairer_different_model_breaks() {
+        // Same session but different model → no pairing.
+        let entries = vec![
+            pairer_entry("m1", "s1", 1000, 200, 50, "model-a", "prov-a"),
+            pairer_entry("m2", "s1", 2000, 175, 170, "model-b", "prov-a"),
+        ];
+        let out = pairer_collect(entries, &HashMap::new());
+        assert_eq!(out[1].metrics.cache_expected, 0);
+        assert_eq!(out[1].metrics.cache_miss, 0);
+    }
+
+    #[test]
+    fn test_pairer_different_provider_breaks() {
+        let entries = vec![
+            pairer_entry("m1", "s1", 1000, 200, 50, "model-a", "prov-a"),
+            pairer_entry("m2", "s1", 2000, 175, 170, "model-a", "prov-b"),
+        ];
+        let out = pairer_collect(entries, &HashMap::new());
+        assert_eq!(out[1].metrics.cache_expected, 0);
+    }
+
+    #[test]
+    fn test_pairer_session_boundary() {
+        // Two sessions: s1 has 2 messages, s2 has 1. s2's message should NOT
+        // pair with s1's last message.
+        let entries = vec![
+            pairer_entry("a1", "s1", 1000, 200, 50, "model-a", "prov-a"),
+            pairer_entry("a2", "s1", 2000, 175, 170, "model-a", "prov-a"),
+            pairer_entry("b1", "s2", 3000, 300, 0, "model-a", "prov-a"),
+        ];
+        let out = pairer_collect(entries, &HashMap::new());
+        assert_eq!(out.len(), 3);
+        assert_eq!(out[1].metrics.cache_expected, 200); // a2 paired with a1
+        assert_eq!(out[1].metrics.cache_miss, 30);
+        assert_eq!(out[2].metrics.cache_expected, 0); // b1 not paired
+    }
+
+    #[test]
+    fn test_pairer_zero_total_passes_through() {
+        // Zero-total messages are excluded from pairing but pass through.
+        // Order: m0 passes through immediately, m1 flushed when m2 arrives, m2 at finish.
+        let entries = vec![
+            pairer_entry("m1", "s1", 1000, 200, 50, "model-a", "prov-a"),
+            pairer_entry("m0", "s1", 1500, 0, 0, "model-a", "prov-a"), // zero total
+            pairer_entry("m2", "s1", 2000, 175, 170, "model-a", "prov-a"),
+        ];
+        let out = pairer_collect(entries, &HashMap::new());
+        assert_eq!(out.len(), 3);
+        // m0 passes through with zero pair values (it's emitted first)
+        assert_eq!(out[0].id, "m0");
+        assert_eq!(out[0].metrics.total, 0);
+        assert_eq!(out[0].metrics.cache_expected, 0);
+        // m1 is flushed (no pair as first message)
+        assert_eq!(out[1].id, "m1");
+        assert_eq!(out[1].metrics.cache_expected, 0);
+        // m2 pairs with m1 (the pending non-zero), NOT m0
+        assert_eq!(out[2].id, "m2");
+        assert_eq!(out[2].metrics.cache_expected, 200);
+        assert_eq!(out[2].metrics.cache_miss, 30);
+    }
+
+    #[test]
+    fn test_pairer_compaction_between_breaks() {
+        // A compaction timestamp strictly between prev and cur should break the pair.
+        let mut compactions: HashMap<String, Vec<i64>> = HashMap::new();
+        compactions.insert("s1".to_string(), vec![1500]); // compaction at ts=1500
+        let entries = vec![
+            pairer_entry("m1", "s1", 1000, 200, 50, "model-a", "prov-a"),
+            pairer_entry("m2", "s1", 2000, 175, 170, "model-a", "prov-a"),
+        ];
+        let out = pairer_collect(entries, &compactions);
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[1].metrics.cache_expected, 0); // compaction broke the pair
+        assert_eq!(out[1].metrics.cache_miss, 0);
+    }
+
+    #[test]
+    fn test_pairer_compaction_at_boundary_not_between() {
+        // Compaction exactly at prev.ts (1000) is NOT strictly between → pair stands.
+        let mut compactions: HashMap<String, Vec<i64>> = HashMap::new();
+        compactions.insert("s1".to_string(), vec![1000]);
+        let entries = vec![
+            pairer_entry("m1", "s1", 1000, 200, 50, "model-a", "prov-a"),
+            pairer_entry("m2", "s1", 2000, 175, 170, "model-a", "prov-a"),
+        ];
+        let out = pairer_collect(entries, &compactions);
+        assert_eq!(out[1].metrics.cache_expected, 200);
+        assert_eq!(out[1].metrics.cache_miss, 30);
+    }
+
+    #[test]
+    fn test_pairer_empty_input() {
+        let out = pairer_collect(vec![], &HashMap::new());
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn test_pairer_single_message() {
+        let entries = vec![pairer_entry("m1", "s1", 1000, 200, 50, "model-a", "prov-a")];
+        let out = pairer_collect(entries, &HashMap::new());
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].metrics.cache_expected, 0);
+        assert_eq!(out[0].metrics.cache_miss, 0);
+    }
+
+    #[test]
+    fn test_pairer_multiple_sessions_interleaved() {
+        // Sessions arrive contiguously (guaranteed by ORDER BY session_id).
+        // s1: m1→m2 (paired), s2: m3→m4 (paired).
+        let entries = vec![
+            pairer_entry("m1", "s1", 1000, 100, 30, "model-a", "prov-a"),
+            pairer_entry("m2", "s1", 2000, 80, 50, "model-a", "prov-a"),
+            pairer_entry("m3", "s2", 3000, 200, 40, "model-a", "prov-a"),
+            pairer_entry("m4", "s2", 4000, 150, 120, "model-a", "prov-a"),
+        ];
+        let out = pairer_collect(entries, &HashMap::new());
+        assert_eq!(out.len(), 4);
+        assert_eq!(out[1].metrics.cache_expected, 100); // m2 paired with m1
+        assert_eq!(out[1].metrics.cache_miss, 50); // 100 - 50
+        assert_eq!(out[3].metrics.cache_expected, 200); // m4 paired with m3
+        assert_eq!(out[3].metrics.cache_miss, 80); // 200 - 120
+    }
+
+    #[test]
+    fn test_pairer_miss_never_negative() {
+        // When cache_read > prev.total, miss should be 0 (clamped).
+        let entries = vec![
+            pairer_entry("m1", "s1", 1000, 100, 50, "model-a", "prov-a"),
+            pairer_entry("m2", "s1", 2000, 80, 200, "model-a", "prov-a"), // cache_read > prev.total
+        ];
+        let out = pairer_collect(entries, &HashMap::new());
+        assert_eq!(out[1].metrics.cache_expected, 100);
+        assert_eq!(out[1].metrics.cache_miss, 0); // max(0, 100-200) = 0
     }
 
     // ── resolve_day_window ───────────────────────────────────────────────
