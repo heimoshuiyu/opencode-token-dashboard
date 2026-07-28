@@ -1383,6 +1383,10 @@ fn aggregate_usage(db_paths: &[PathBuf], range_value: Option<&str>) -> Result<Us
             .map(|((provider, model), day_map)| {
                 let mut day_entries: Vec<ProviderModelDayEntry> = day_map
                     .into_iter()
+                    .filter(|(bucket, _)| {
+                        let day = bucket.split_once('T').map_or(bucket.as_str(), |(d, _)| d);
+                        in_window(day)
+                    })
                     .map(|(date, metrics)| ProviderModelDayEntry { date, metrics })
                     .collect();
                 day_entries.sort_by(|a, b| a.date.cmp(&b.date));
@@ -3388,6 +3392,26 @@ mod tests {
             dedup_sum > 0,
             "range=30 heatmap runtime_dedup should be > 0 (got {dedup_sum})"
         );
+    }
+
+    #[test]
+    fn test_aggregate_usage_provider_model_trends_within_window() {
+        let db_path = discover_databases().expect("need opencode.db").into_iter().next().unwrap();
+        for range in ["7", "30", "90"] {
+            let payload = aggregate_usage(&[db_path.clone()], Some(range)).expect("aggregate should succeed");
+            let first = payload.meta.first_day.as_deref().expect("window first day");
+            let last = payload.meta.last_day.as_deref().expect("window last day");
+            for trend in &payload.provider_model_trends {
+                for entry in &trend.days {
+                    let day = entry.date.split_once('T').map_or(entry.date.as_str(), |(d, _)| d);
+                    assert!(
+                        day >= first && day <= last,
+                        "range={range}: trend {}/{} has out-of-window date {} (window {}..={})",
+                        trend.provider, trend.model, entry.date, first, last
+                    );
+                }
+            }
+        }
     }
 
     #[test]
