@@ -125,10 +125,12 @@ export function ProviderChart({ items, metric, loading }: ProviderChartProps) {
               stroke="var(--background)"
               animationBegin={200}
               animationDuration={600}
+              labelLine
               label={(props: any) => {
-                const { name, percent } = props;
+                const { name, percent, x, y, cx } = props;
+                const anchor = x >= cx ? "start" : "end";
                 return (
-                  <text className="font-mono" fill="var(--foreground)" fontSize={11} textAnchor="middle">
+                  <text x={x} y={y} className="font-mono" fill="var(--foreground)" fontSize={11} textAnchor={anchor} dominantBaseline="central">
                     {`${truncateText(name || "", 9)} ${((percent || 0) * 100).toFixed(0)}%`}
                   </text>
                 );
