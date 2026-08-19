@@ -169,6 +169,8 @@ opencode-token-dashboard/
 The previous version displayed "cache hit rate", defined as
 `(cache_read + cache_write) / (input + cache_read + cache_write)`.
 
+The current dashboard still shows a cache hit rate on the summary cards, but with the stricter definition `cache_read / (input + cache_read + cache_write)` — cache writes (newly created cache) count only toward the denominator (billed input), since a write is not a hit (matching deepseek-harness).
+
 This has a fundamental problem: **the ratio fluctuates with the user's usage patterns and context length**. For example, injecting large amounts of new content each turn (long context) significantly lowers the hit rate — but that reflects usage style, not the caching capability of the agent harness or provider. The ratio conflates "context scale" with "cache quality", making it impossible to cleanly isolate the latter.
 
 We therefore switched to "Cache Miss Tokens": counting the absolute number of tokens that **should have been cached but weren't** between consecutive requests. This directly measures reprocessed, wasted tokens without context-length normalization interference, providing a truer reflection of caching performance.

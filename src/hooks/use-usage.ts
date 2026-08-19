@@ -8,13 +8,15 @@ function getLocale(): Locale {
 }
 
 /**
- * Compute cache hit rate: (cache_read + cache_write) / (input + cache_read + cache_write) * 100
+ * Compute cache hit rate: cache_read / (input + cache_read + cache_write) * 100
+ * cache_write (newly created cache) counts toward the denominator (billed
+ * input) but not the numerator — a write is not a hit. Matches deepseek-harness.
  * Returns a number like 65.3 meaning 65.3%.
  */
 function computeCacheHitRate(entry: { input: number; cache_read: number; cache_write: number }): number {
   const inputTotal = (entry.input || 0) + (entry.cache_read || 0) + (entry.cache_write || 0);
   if (inputTotal === 0) return 0;
-  return Math.round(((entry.cache_read || 0) + (entry.cache_write || 0)) / inputTotal * 1000) / 10;
+  return Math.round((entry.cache_read || 0) / inputTotal * 1000) / 10;
 }
 
 function enrichPayload(payload: UsagePayload): UsagePayload {

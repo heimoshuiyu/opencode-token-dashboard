@@ -181,6 +181,8 @@ opencode-token-dashboard/
 旧版本展示的是「缓存命中率」，定义为
 `(cache_read + cache_write) / (input + cache_read + cache_write)`。
 
+当前版本在汇总卡片上仍会展示缓存命中率，但改用了更严格的定义 `cache_read / (input + cache_read + cache_write)` —— 缓存写入（本次新建的缓存）只计入分母（计费输入），不计入分子，因为「写入」不是「命中」（与 deepseek-harness 口径一致）。
+
 它有一个根本问题：**这个比率会随用户的使用模式和上下文长度而波动**。例如，用户每轮都注入大量新内容（长上下文）会显著拉低命中率——但这反映的是使用方式，而非 agent harness 或 provider 自身的缓存能力。比率把「上下文规模」和「缓存质量」混在一起，无法干净地反映后两者真正的问题。
 
 因此改为「缓存未命中 Tokens」：统计相邻请求之间**应命中却没命中**的 token 绝对数。它直接度量被重复处理、被浪费的 token，不受上下文长度归一化的干扰，更能真实反映 harness / provider 的缓存表现。

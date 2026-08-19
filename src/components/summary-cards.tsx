@@ -36,7 +36,7 @@ function uniqueDayCount(days: DayEntry[]): number {
 /** Recompute cache_hit_rate from raw counter fields (it's a rate, not additive). */
 function recomputeCacheHitRate(entry: { input: number; cache_read: number; cache_write: number; cache_hit_rate: number }): void {
   const inputTotal = (entry.input || 0) + (entry.cache_read || 0) + (entry.cache_write || 0);
-  entry.cache_hit_rate = inputTotal === 0 ? 0 : Math.round(((entry.cache_read || 0) + (entry.cache_write || 0)) / inputTotal * 1000) / 10;
+  entry.cache_hit_rate = inputTotal === 0 ? 0 : Math.round((entry.cache_read || 0) / inputTotal * 1000) / 10;
 }
 
 /**
