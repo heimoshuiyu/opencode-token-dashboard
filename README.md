@@ -133,6 +133,8 @@ OpenCode V2 development channels may use names such as `opencode-local.db`. The 
 OPENCODE_DB_PATH="$HOME/.local/share/opencode/opencode-local.db" ./target/release/opencode-token-dashboard
 ```
 
+Within a single database, both storage generations are handled per table: messages are read from the V1 `message`/`part` tables or the V2 `session_message` table (whichever holds more rows — migration residue is not double-counted), and sessions resolve across the V1 `session` and V2 `session_v2` tables. This mixed state is the norm after the OpenCode V2 storage switch: new sessions are recorded only in `session_v2` while migrated history stays in `session`, and the dashboard left-joins both so neither old nor new data is dropped.
+
 ## Project Structure
 
 ```

@@ -145,6 +145,8 @@ OpenCode V2 的开发 channel 可能使用 `opencode-local.db` 等文件名。�
 OPENCODE_DB_PATH="$HOME/.local/share/opencode/opencode-local.db" ./target/release/opencode-token-dashboard
 ```
 
+单个数据库内部则按表分代处理：消息从 V1 的 `message`/`part` 表或 V2 的 `session_message` 表读取（取行数多的那张，迁移残留不会重复计数），会话信息则同时从 V1 的 `session` 表和 V2 的 `session_v2` 表解析。OpenCode V2 存储切换后的数据库天然是混合状态——新会话只记录在 `session_v2`，迁移来的历史仍在 `session`——看板对两张表做 LEFT JOIN，新旧数据都不会丢。
+
 ## 项目结构
 
 ```
