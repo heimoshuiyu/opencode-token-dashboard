@@ -761,6 +761,50 @@ fn detect_message_storage(conn: &rusqlite::Connection) -> Result<MessageStorage,
     }
 }
 
+/// JOIN + directory filter fragment for V2 `session_message` queries.
+///
+/// Since the OpenCode V2 storage switch, *new* sessions live only in
+/// `session_v2` (older / migrated ones still in `session`). A plain
+/// `JOIN session` silently drops every message of new sessions, so we LEFT
+/// JOIN both and take whichever directory exists.
+fn v2_session_scope(conn: &rusqlite::Connection) -> String {
+    if table_exists(conn, "session_v2").unwrap_or(false) {
+        "LEFT JOIN session s ON m.session_id = s.id \
+         LEFT JOIN session_v2 s2 ON m.session_id = s2.id \
+         WHERE COALESCE(s.directory, s2.directory) NOT LIKE '%.opencode%' \
+         AND COALESCE(s.directory, s2.directory) NOT LIKE '/home/hmsy/.config/pet%'"
+            .to_string()
+    } else {
+        "JOIN session s ON m.session_id = s.id \
+         WHERE s.directory NOT LIKE '%.opencode%' \
+         AND s.directory NOT LIKE '/home/hmsy/.config/pet%'"
+            .to_string()
+    }
+}
+
+/// IDs of child sessions across both the V1 `session` and V2 `session_v2`
+/// tables (subagents are recorded via `parent_id` in either).
+fn load_child_session_ids(conn: &rusqlite::Connection) -> HashSet<String> {
+    let mut ids: HashSet<String> = conn
+        .prepare("SELECT id FROM session WHERE parent_id IS NOT NULL")
+        .and_then(|mut stmt| {
+            stmt.query_map([], |row| row.get::<_, String>(0))
+                .map(|rows| rows.filter_map(|r| r.ok()).collect())
+        })
+        .unwrap_or_default();
+    if table_exists(conn, "session_v2").unwrap_or(false) {
+        let v2: HashSet<String> = conn
+            .prepare("SELECT id FROM session_v2 WHERE parent_id IS NOT NULL")
+            .and_then(|mut stmt| {
+                stmt.query_map([], |row| row.get::<_, String>(0))
+                    .map(|rows| rows.filter_map(|r| r.ok()).collect())
+            })
+            .unwrap_or_default();
+        ids.extend(v2);
+    }
+    ids
+}
+
 /// Build an `AssistantEntry` from a parsed assistant message. Returns `None`
 /// when the row is not a usable assistant message (wrong role, or no usable
 /// timestamp). The bucket strings depend on `hourly` / `heatmap_hourly`.
@@ -831,13 +875,7 @@ fn load_assistant_entries(
     hourly: bool,
     heatmap_hourly: bool,
 ) -> Result<(Vec<AssistantEntry>, Option<String>, Option<String>, i64, HashSet<String>), String> {
-    let child_session_ids: HashSet<String> = conn
-        .prepare("SELECT id FROM session WHERE parent_id IS NOT NULL")
-        .and_then(|mut stmt| {
-            stmt.query_map([], |row| row.get::<_, String>(0))
-                .map(|rows| rows.filter_map(|r| r.ok()).collect())
-        })
-        .unwrap_or_default();
+    let child_session_ids: HashSet<String> = load_child_session_ids(conn);
 
     let query = match storage {
         MessageStorage::V1 => {
@@ -847,18 +885,19 @@ fn load_assistant_entries(
              AND s.directory NOT LIKE '%.opencode%' \
              AND s.directory NOT LIKE '/home/hmsy/.config/pet%' \
              ORDER BY m.time_created ASC"
+                .to_string()
         }
         MessageStorage::V2 => {
-            "SELECT m.id, m.session_id, m.type, m.data FROM session_message m \
-             JOIN session s ON m.session_id = s.id \
-             WHERE m.type = 'assistant' \
-             AND s.directory NOT LIKE '%.opencode%' \
-             AND s.directory NOT LIKE '/home/hmsy/.config/pet%' \
-             ORDER BY m.time_created ASC"
+            format!(
+                "SELECT m.id, m.session_id, m.type, m.data FROM session_message m {} \
+                 AND m.type = 'assistant' \
+                 ORDER BY m.time_created ASC",
+                v2_session_scope(conn)
+            )
         }
     };
     let mut stmt = conn
-        .prepare(query)
+        .prepare(&query)
         .map_err(|e| format!("查询 assistant 消息失败: {e}"))?;
 
     let rows = stmt
@@ -916,18 +955,19 @@ fn load_compaction_times(
              WHERE json_extract(p.data, '$.type') = 'compaction' \
              AND s.directory NOT LIKE '%.opencode%' \
              AND s.directory NOT LIKE '/home/hmsy/.config/pet%'"
+                .to_string()
         }
         MessageStorage::V2 => {
-            "SELECT m.session_id, m.time_created FROM session_message m \
-             JOIN session s ON m.session_id = s.id \
-             WHERE m.type = 'compaction' \
-             AND json_extract(m.data, '$.status') = 'completed' \
-             AND s.directory NOT LIKE '%.opencode%' \
-             AND s.directory NOT LIKE '/home/hmsy/.config/pet%'"
+            format!(
+                "SELECT m.session_id, m.time_created FROM session_message m {} \
+                 AND m.type = 'compaction' \
+                 AND json_extract(m.data, '$.status') = 'completed'",
+                v2_session_scope(conn)
+            )
         }
     };
     let mut stmt = conn
-        .prepare(query)
+        .prepare(&query)
         .map_err(|e| format!("查询 compaction 消息失败: {e}"))?;
     let rows = stmt
         .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)))
@@ -1028,18 +1068,19 @@ fn load_database_usage(
              AND s.directory NOT LIKE '%.opencode%' \
              AND s.directory NOT LIKE '/home/hmsy/.config/pet%' \
              ORDER BY m.session_id ASC, m.time_created ASC"
+                .to_string()
         }
         MessageStorage::V2 => {
-            "SELECT m.id, m.session_id, m.type, m.data FROM session_message m \
-             JOIN session s ON m.session_id = s.id \
-             WHERE m.type IN ('assistant', 'user') \
-             AND s.directory NOT LIKE '%.opencode%' \
-             AND s.directory NOT LIKE '/home/hmsy/.config/pet%' \
-             ORDER BY m.session_id ASC, m.time_created ASC"
+            format!(
+                "SELECT m.id, m.session_id, m.type, m.data FROM session_message m {} \
+                 AND m.type IN ('assistant', 'user') \
+                 ORDER BY m.session_id ASC, m.time_created ASC",
+                v2_session_scope(&conn)
+            )
         }
     };
     let mut stmt = conn
-        .prepare(query)
+        .prepare(&query)
         .map_err(|e| format!("查询消息失败: {e}"))?;
 
     let rows = stmt
@@ -1764,11 +1805,23 @@ fn aggregate_cache_miss_session_detail(
                 continue;
             }
         };
-        let row: Result<(String, String), rusqlite::Error> = c.query_row(
-            "SELECT title, directory FROM session WHERE id = ?",
-            rusqlite::params![session_id],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        );
+        let row: Result<(String, String), rusqlite::Error> = c
+            .query_row(
+                "SELECT title, directory FROM session WHERE id = ?",
+                rusqlite::params![session_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .or_else(|e| {
+                if !matches!(e, rusqlite::Error::QueryReturnedNoRows) {
+                    return Err(e);
+                }
+                // New V2 sessions live only in `session_v2`.
+                c.query_row(
+                    "SELECT COALESCE(title, ''), directory FROM session_v2 WHERE id = ?",
+                    rusqlite::params![session_id],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+            });
         match row {
             Ok(r) => {
                 conn = Some(c);
@@ -1799,18 +1852,19 @@ fn aggregate_cache_miss_session_detail(
              AND s.directory NOT LIKE '%.opencode%' \
              AND s.directory NOT LIKE '/home/hmsy/.config/pet%' \
              ORDER BY m.time_created ASC"
+                .to_string()
         }
         MessageStorage::V2 => {
-            "SELECT m.id, m.type, m.data FROM session_message m \
-             JOIN session s ON m.session_id = s.id \
-             WHERE m.session_id = ? AND m.type = 'assistant' \
-             AND s.directory NOT LIKE '%.opencode%' \
-             AND s.directory NOT LIKE '/home/hmsy/.config/pet%' \
-             ORDER BY m.time_created ASC"
+            format!(
+                "SELECT m.id, m.type, m.data FROM session_message m {} \
+                 AND m.session_id = ? AND m.type = 'assistant' \
+                 ORDER BY m.time_created ASC",
+                v2_session_scope(&conn)
+            )
         }
     };
     let mut stmt = conn
-        .prepare(query)
+        .prepare(&query)
         .map_err(|e| format!("查询失败: {e}"))?;
     let mut entries: Vec<AssistantEntry> = Vec::new();
     let rows = stmt
@@ -2007,13 +2061,23 @@ fn get_message_content(db_paths: &[PathBuf], message_id: &str) -> Result<Message
             MessageStorage::V1 => {
                 "SELECT m.data, s.directory FROM message m JOIN session s ON m.session_id = s.id \
                  WHERE m.id = ? AND m.data LIKE '%\"role\":\"assistant\"%'"
+                    .to_string()
             }
             MessageStorage::V2 => {
-                "SELECT m.data, s.directory FROM session_message m JOIN session s ON m.session_id = s.id \
-                 WHERE m.id = ? AND m.type = 'assistant'"
+                if table_exists(&c, "session_v2").unwrap_or(false) {
+                    "SELECT m.data, COALESCE(s.directory, s2.directory) FROM session_message m \
+                     LEFT JOIN session s ON m.session_id = s.id \
+                     LEFT JOIN session_v2 s2 ON m.session_id = s2.id \
+                     WHERE m.id = ? AND m.type = 'assistant'"
+                        .to_string()
+                } else {
+                    "SELECT m.data, s.directory FROM session_message m JOIN session s ON m.session_id = s.id \
+                     WHERE m.id = ? AND m.type = 'assistant'"
+                        .to_string()
+                }
             }
         };
-        match c.query_row(query, rusqlite::params![message_id], |row| {
+        match c.query_row(&query, rusqlite::params![message_id], |row| {
             Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
         }) {
             Ok((data, dir)) => {
