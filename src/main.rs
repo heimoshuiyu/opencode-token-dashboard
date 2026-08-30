@@ -765,20 +765,51 @@ fn detect_message_storage(conn: &rusqlite::Connection) -> Result<MessageStorage,
 ///
 /// Since the OpenCode V2 storage switch, *new* sessions live only in
 /// `session_v2` (older / migrated ones still in `session`). A plain
-/// `JOIN session` silently drops every message of new sessions, so we LEFT
-/// JOIN both and take whichever directory exists.
+/// `JOIN session` silently drops every message of new sessions, so when both
+/// tables exist we LEFT JOIN both and take whichever directory exists.
+///
+/// OpenCode's 2026-08 storage migration (`loose_psylocke`) *renames*
+/// `session` to `session_v2` in place, and databases created fresh by newer
+/// builds only ever contain `session_v2` — so `session` may be missing
+/// entirely. A LEFT JOIN still fails to prepare against a nonexistent table
+/// (`no such table: session`), hence the three variants below.
 fn v2_session_scope(conn: &rusqlite::Connection) -> String {
-    if table_exists(conn, "session_v2").unwrap_or(false) {
-        "LEFT JOIN session s ON m.session_id = s.id \
-         LEFT JOIN session_v2 s2 ON m.session_id = s2.id \
-         WHERE COALESCE(s.directory, s2.directory) NOT LIKE '%.opencode%' \
-         AND COALESCE(s.directory, s2.directory) NOT LIKE '/home/hmsy/.config/pet%'"
-            .to_string()
+    let has_session = table_exists(conn, "session").unwrap_or(false);
+    let has_session_v2 = table_exists(conn, "session_v2").unwrap_or(false);
+    match (has_session, has_session_v2) {
+        (true, true) => {
+            "LEFT JOIN session s ON m.session_id = s.id \
+             LEFT JOIN session_v2 s2 ON m.session_id = s2.id \
+             WHERE COALESCE(s.directory, s2.directory) NOT LIKE '%.opencode%' \
+             AND COALESCE(s.directory, s2.directory) NOT LIKE '/home/hmsy/.config/pet%'"
+                .to_string()
+        }
+        (false, true) => {
+            "LEFT JOIN session_v2 s ON m.session_id = s.id \
+             WHERE s.directory NOT LIKE '%.opencode%' \
+             AND s.directory NOT LIKE '/home/hmsy/.config/pet%'"
+                .to_string()
+        }
+        (true, false) => {
+            "JOIN session s ON m.session_id = s.id \
+             WHERE s.directory NOT LIKE '%.opencode%' \
+             AND s.directory NOT LIKE '/home/hmsy/.config/pet%'"
+                .to_string()
+        }
+        // Neither table: no directory metadata to filter on — keep all rows.
+        (false, false) => "WHERE 1 = 1".to_string(),
+    }
+}
+
+/// Directory SELECT expression matching the aliases emitted by
+/// [`v2_session_scope`] (`s` always exists; `s2` only when both tables do).
+fn v2_session_directory_expr(conn: &rusqlite::Connection) -> &'static str {
+    let has_session = table_exists(conn, "session").unwrap_or(false);
+    let has_session_v2 = table_exists(conn, "session_v2").unwrap_or(false);
+    if has_session && has_session_v2 {
+        "COALESCE(s.directory, s2.directory)"
     } else {
-        "JOIN session s ON m.session_id = s.id \
-         WHERE s.directory NOT LIKE '%.opencode%' \
-         AND s.directory NOT LIKE '/home/hmsy/.config/pet%'"
-            .to_string()
+        "s.directory"
     }
 }
 
@@ -1025,13 +1056,9 @@ fn load_database_usage(
     let conn = rusqlite_connection(db_path)?;
     let storage = detect_message_storage(&conn)?;
 
-    let child_session_ids: HashSet<String> = conn
-        .prepare("SELECT id FROM session WHERE parent_id IS NOT NULL")
-        .and_then(|mut stmt| {
-            stmt.query_map([], |row| row.get::<_, String>(0))
-                .map(|rows| rows.filter_map(|r| r.ok()).collect())
-        })
-        .unwrap_or_default();
+    // Child sessions (subagents) may live in `session` and/or `session_v2`;
+    // the helper checks both and tolerates either table being absent.
+    let child_session_ids: HashSet<String> = load_child_session_ids(&conn);
 
     let compaction_times = load_compaction_times(&conn, storage)?;
 
@@ -1618,16 +1645,26 @@ fn load_database_cache_miss(db_path: &Path) -> Result<DatabaseCacheMiss, String>
     let compaction_times = load_compaction_times(&conn, storage)?;
     pair_cache_miss(&mut entries, &compaction_times);
 
+    // Titles live in `session` (pre-split) and/or `session_v2` (post-split).
+    // Either table may be absent — OpenCode renamed `session` to `session_v2`
+    // during the 2026-08 migration, and fresh databases only have `session_v2`.
+    // Titles are cosmetic, so a failed read degrades instead of failing the request.
     let mut titles: HashMap<String, String> = HashMap::new();
-    let mut stmt = conn
-        .prepare("SELECT id, title FROM session")
-        .map_err(|e| format!("查询 session 失败: {e}"))?;
-    let rows = stmt
-        .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))
-        .map_err(|e| format!("执行查询失败: {e}"))?;
-    for r in rows {
-        if let Ok((id, t)) = r {
-            titles.insert(id, t);
+    for table in ["session", "session_v2"] {
+        if !table_exists(&conn, table).unwrap_or(false) {
+            continue;
+        }
+        let Ok(mut stmt) = conn.prepare(&format!("SELECT id, title FROM {table}")) else {
+            continue;
+        };
+        let Ok(rows) = stmt
+            .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))
+        else {
+            continue;
+        };
+        // Later tables win so post-migration titles take precedence.
+        for r in rows.flatten() {
+            titles.insert(r.0, r.1);
         }
     }
 
@@ -2064,17 +2101,12 @@ fn get_message_content(db_paths: &[PathBuf], message_id: &str) -> Result<Message
                     .to_string()
             }
             MessageStorage::V2 => {
-                if table_exists(&c, "session_v2").unwrap_or(false) {
-                    "SELECT m.data, COALESCE(s.directory, s2.directory) FROM session_message m \
-                     LEFT JOIN session s ON m.session_id = s.id \
-                     LEFT JOIN session_v2 s2 ON m.session_id = s2.id \
-                     WHERE m.id = ? AND m.type = 'assistant'"
-                        .to_string()
-                } else {
-                    "SELECT m.data, s.directory FROM session_message m JOIN session s ON m.session_id = s.id \
-                     WHERE m.id = ? AND m.type = 'assistant'"
-                        .to_string()
-                }
+                let dir = v2_session_directory_expr(&c);
+                format!(
+                    "SELECT m.data, {dir} FROM session_message m {} \
+                     AND m.id = ? AND m.type = 'assistant'",
+                    v2_session_scope(&c)
+                )
             }
         };
         match c.query_row(&query, rusqlite::params![message_id], |row| {
@@ -3627,6 +3659,109 @@ mod tests {
         // Clean up
         let _ = std::fs::remove_file(&db1);
         let _ = std::fs::remove_file(&db2);
+    }
+
+    // ── Post-rename schema (no `session` table) ─────────────────────────
+
+    /// Build a database shaped like `opencode-local.db` after OpenCode's
+    /// 2026-08 storage migration: sessions live only in `session_v2` (the
+    /// migration RENAMEs `session` away), messages in `session_message`, and
+    /// empty `message`/`part` residue is left behind. Includes a completed
+    /// compaction row between the two assistant messages.
+    fn make_session_v2_only_db(prefix: &str) -> PathBuf {
+        let unique = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let db_path = std::env::temp_dir().join(format!(
+            "opencode-dashboard-{prefix}-{unique}.db"
+        ));
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE message (id TEXT PRIMARY KEY, data TEXT NOT NULL);
+             CREATE TABLE part (id TEXT PRIMARY KEY, data TEXT NOT NULL);
+             CREATE TABLE session_v2 (
+                id TEXT PRIMARY KEY,
+                parent_id TEXT,
+                directory TEXT NOT NULL,
+                title TEXT NOT NULL
+             );
+             CREATE TABLE session_message (
+                id TEXT PRIMARY KEY,
+                session_id TEXT NOT NULL,
+                type TEXT NOT NULL,
+                seq INTEGER NOT NULL,
+                time_created INTEGER NOT NULL,
+                data TEXT NOT NULL
+             );
+             INSERT INTO session_v2 VALUES ('ses_v2only', NULL, '/tmp/project', 'v2-only title');",
+        )
+        .unwrap();
+        let assistant = |created: i64| {
+            r#"{"time":{"created":CREATED,"completed":CREATEDADD},"model":{"id":"model-x","providerID":"prov-x"},"content":[{"type":"text","text":"hi"}],"tokens":{"input":100,"output":10,"reasoning":0,"cache":{"read":50,"write":0}}}"#
+                .replace("CREATEDADD", &(created + 1000).to_string())
+                .replace("CREATED", &created.to_string())
+        };
+        conn.execute(
+            "INSERT INTO session_message VALUES ('msg_v2_0', 'ses_v2only', 'assistant', 0, 1000, ?)",
+            rusqlite::params![assistant(1000)],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO session_message VALUES ('cmp_v2', 'ses_v2only', 'compaction', 1, 2500, ?)",
+            rusqlite::params![r#"{"status":"completed","reason":"auto","summary":"...","time":{"created":2500}}"#],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO session_message VALUES ('msg_v2_1', 'ses_v2only', 'assistant', 2, 2000, ?)",
+            rusqlite::params![assistant(2000)],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO session_message VALUES ('msg_v2_2', 'ses_v2only', 'assistant', 3, 3000, ?)",
+            rusqlite::params![assistant(3000)],
+        )
+        .unwrap();
+        drop(conn);
+        db_path
+    }
+
+    /// Regression test for the `no such table: session` failure: the old
+    /// `v2_session_scope` unconditionally LEFT JOINed `session`, which fails
+    /// to prepare on databases where the migration renamed it away.
+    #[test]
+    fn test_session_v2_only_database() {
+        let db_path = make_session_v2_only_db("v2only");
+
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        assert_eq!(detect_message_storage(&conn).unwrap(), MessageStorage::V2);
+        // This exact call used to fail with "no such table: session".
+        let compactions = load_compaction_times(&conn, MessageStorage::V2).unwrap();
+        // Entries carry the `completed` timestamp (1000+1000 and 2000+1000),
+        // so the compaction at 2500 sits strictly between the pair.
+        assert_eq!(compactions.get("ses_v2only").map(Vec::as_slice), Some(&[2500i64][..]));
+        drop(conn);
+
+        // End-to-end: usage aggregation succeeds. The compaction breaks the
+        // first pair (msg_v2_0 → msg_v2_1 contributes nothing) while the
+        // post-compaction pair (msg_v2_1 → msg_v2_2) yields expected 160,
+        // miss 110.
+        let usage = aggregate_usage(&[db_path.clone()], None).unwrap();
+        assert_eq!(usage.summary.total, 480); // 3 × (100 + 10 + 50)
+        assert_eq!(usage.summary.cache_miss, 110);
+        assert_eq!(usage.summary.cache_expected, 160);
+
+        // Cache-miss sessions endpoint: titles must come from session_v2.
+        let sessions = aggregate_cache_miss_sessions(&[db_path.clone()], None, None, None, None).unwrap();
+        assert_eq!(sessions.sessions.len(), 1);
+        assert_eq!(sessions.sessions[0].title, "v2-only title");
+        assert_eq!(sessions.sessions[0].cache_miss, 110);
+
+        // Message detail lookup works without the `session` table too.
+        let content = get_message_content(&[db_path.clone()], "msg_v2_1").unwrap();
+        assert_eq!(content.metadata.provider.as_deref(), Some("prov-x"));
+
+        let _ = std::fs::remove_file(&db_path);
     }
 
     // ── HTTP handler tests (using axum test utilities) ───────────────────
